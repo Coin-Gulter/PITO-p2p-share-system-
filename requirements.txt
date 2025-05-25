@@ -1,0 +1,16 @@
+fastapi
+uvicorn[standard]
+pyqt5
+watchdog
+zeroconf
+aiofiles
+pyjwt
+cryptography
+netifaces>=0.11.0
+
+# Testing dependencies
+pytest>=7.4.0
+pytest-asyncio>=0.21.1
+pytest-qt>=4.2.0
+httpx>=0.24.1  # Required for TestClient
+pytest-cov>=4.1.0  # For test coverage reporting
