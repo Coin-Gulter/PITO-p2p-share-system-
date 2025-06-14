@@ -46,15 +46,15 @@ def generate_self_signed_cert(common_name: str):
     with open(settings.tls_cert, "wb") as f:
         f.write(cert.public_bytes(serialization.Encoding.PEM))
 
-    print("[✔] Generated self-signed certificate and key.")
+    print("[+] Generated self-signed certificate and key.")
 
 
 def ensure_certificates():
     if not settings.tls_cert.exists() or not settings.tls_key.exists():
-        print("[⚠] TLS certificate or key not found. Generating new self-signed cert...")
+        print("[-] TLS certificate or key not found. Generating new self-signed cert...")
         generate_self_signed_cert(common_name=settings.device_id)
     else:
-        print("[✔] Found existing TLS certificate and key.")
+        print("[+] Found existing TLS certificate and key.")
 
 
 if __name__ == "__main__":

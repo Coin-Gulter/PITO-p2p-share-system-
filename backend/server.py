@@ -460,9 +460,9 @@ async def upload_folder(
             try:
                 file_size = int(content_length)
                 logger.info(f"Zip file size: {file_size} bytes")
-                # Check if file is too large (e.g., 2GB)
-                if file_size > 2 * 1024 * 1024 * 1024:
-                    raise HTTPException(status_code=400, detail="Zip file exceeds maximum size limit of 2GB")
+                # Check if file is too large (e.g., 2TB)
+                if file_size > 2 * 1024 * 1024 * 1024 * 1024: # 2TB, effectively unlimited for most purposes
+                    raise HTTPException(status_code=400, detail="Zip file exceeds maximum size limit of 2TB")
             except ValueError:
                 logger.warning("Invalid content-length header")
                 file_size = None
