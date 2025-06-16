@@ -6,14 +6,15 @@ from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QLabel,
                              QPushButton, QListWidget, QListWidgetItem, QFileDialog,
                              QHBoxLayout, QMessageBox, QTreeWidget, QTreeWidgetItem,
                              QSplitter, QCheckBox, QProgressBar, QLineEdit, QToolBar,
-                             QDialog, QProgressDialog)
+                             QDialog, QProgressDialog, QFormLayout, QInputDialog) # Added QInputDialog
 from PyQt5.QtCore import QTimer, Qt, QSize, pyqtSignal, QThread, QProcess, QObject
 from PyQt5.QtGui import QIcon, QFont
 import sys
 import requests
 from shared.discovery import PeerDiscovery
-from shared.config import settings
-from shared.logging_config import setup_logger
+from shared.config import settings, CONFIG_DIR # Import CONFIG_DIR
+from shared.security_manager import SecurityManager # Import SecurityManager class
+from shared.logging_config import setup_logger # Import setup_logger
 import threading
 import json
 from pathlib import Path
@@ -26,6 +27,11 @@ import base64
 
 # Set up logger
 logger = setup_logger(__name__)
+
+# Global Security Manager instance (from main.py)
+# It's assumed that main.py has already initialized and loaded the key into this instance
+security_manager = SecurityManager(CONFIG_DIR) # Re-instantiate here, but main.py sets the key.
+
 
 class FileBrowser(QTreeWidget):
     def __init__(self, parent=None):
@@ -51,6 +57,74 @@ class FileBrowser(QTreeWidget):
         if timestamp is None:
             return ""
         return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+
+
+class SecuritySettingsDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Security Settings")
+        self.setFixedSize(400, 200) # Fixed size for simplicity
+        
+        layout = QFormLayout()
+
+        self.hash_label = QLabel("Stored Hash (Base64):")
+        self.hash_value = QLineEdit()
+        self.hash_value.setReadOnly(True)
+        self.hash_value.setPlaceholderText("Not set or unavailable")
+        layout.addRow(self.hash_label, self.hash_value)
+
+        # Get and display the current hash
+        stored_hash = security_manager.get_stored_hash_b64()
+        if stored_hash:
+            self.hash_value.setText(stored_hash)
+        
+        self.change_password_button = QPushButton("Change Security Code")
+        self.change_password_button.clicked.connect(self._change_password_dialog)
+        layout.addRow(self.change_password_button)
+
+        self.setLayout(layout)
+
+    def _change_password_dialog(self):
+        """Handles the 'Change Security Code' process."""
+        if not security_manager.is_initialized():
+            QMessageBox.warning(self, "Security", "Security is not initialized. Please restart to set it up.")
+            return
+
+        old_password, ok = QInputDialog.getText(self, "Change Security Code",
+                                                "Enter your OLD security code:",
+                                                QLineEdit.Password)
+        if not ok or not old_password:
+            return
+
+        # Verify old password
+        if not security_manager.load_security(old_password): # Temporarily load to verify
+            QMessageBox.warning(self, "Incorrect Old Code", "The old security code you entered is incorrect.")
+            return
+
+        # Prompt for new password
+        while True:
+            new_password, ok_new = QInputDialog.getText(self, "Change Security Code",
+                                                        "Enter your NEW security code:",
+                                                        QLineEdit.Password)
+            if not ok_new or not new_password:
+                QMessageBox.warning(self, "Invalid New Code", "New security code cannot be empty.")
+                return
+
+            confirm_password, ok_confirm = QInputDialog.getText(self, "Change Security Code",
+                                                                "Confirm your NEW security code:",
+                                                                QLineEdit.Password)
+            if not ok_confirm or new_password != confirm_password:
+                QMessageBox.warning(self, "Mismatch", "New security codes do not match.")
+                continue
+            break
+
+        if security_manager.change_password(old_password, new_password):
+            QMessageBox.information(self, "Success", "Security code changed successfully!")
+            # Update displayed hash
+            self.hash_value.setText(security_manager.get_stored_hash_b64())
+        else:
+            QMessageBox.critical(self, "Error", "Failed to change security code. Please check logs.")
+
 
 class UploadDialog(QDialog):
     def __init__(self, parent=None, is_folder=False):
@@ -207,7 +281,7 @@ class ProgressFileReader:
         return False
 
 class UploadWorker(QThread):
-    """Worker thread for file/folder uploads"""
+    """Worker thread for file/folder uploads, encrypting files before sending."""
     progress = pyqtSignal(int, str)  # progress percentage, status message
     finished = pyqtSignal(bool, str)  # success, message
     
@@ -226,11 +300,18 @@ class UploadWorker(QThread):
         
     def run(self):
         try:
+            # Ensure encryption key is available
+            if security_manager.get_encryption_key() is None:
+                raise ValueError("Encryption key is not loaded. Cannot upload securely.")
+
             logger.info(f"Starting upload worker for {'folder' if self.is_folder else 'file'}: {self.source_path}")
             if self.is_folder:
                 self.upload_folder()
             else:
                 self.upload_file()
+        except ValueError as ve:
+            logger.error(f"Upload error: {ve}", exc_info=True)
+            self.finished.emit(False, f"Upload failed: {ve}. (Security key missing?)")
         except Exception as e:
             if not self._is_cancelled:
                 logger.error(f"Upload error: {str(e)}", exc_info=True)
@@ -251,20 +332,35 @@ class UploadWorker(QThread):
         return reader
     
     def upload_file(self):
-        """Upload a single file with improved error handling"""
+        """Encrypts and uploads a single file."""
         if self._is_cancelled:
             return
             
+        temp_encrypted_path = None
         try:
             filename = Path(self.source_path).name
-            file_size = os.path.getsize(self.source_path)
             
-            logger.info(f"Starting file upload: {filename} ({file_size} bytes)")
-            logger.debug(f"Source path: {self.source_path}")
-            logger.debug(f"Destination path: {self.dest_path}")
+            logger.info(f"Preparing file for upload (encrypting): {filename}")
+            self.progress.emit(0, f"Encrypting {filename}...") # Changed from print_json_message for QThread
+
+            # Read original content
+            with open(self.source_path, 'rb') as f_read:
+                original_data = f_read.read()
+
+            # Encrypt data
+            encrypted_data = security_manager.encrypt_data(original_data)
+            encrypted_size = len(encrypted_data)
             
-            with open(self.source_path, "rb") as f:
-                progress_file_reader = self._progress_reader(f, file_size)
+            # Write encrypted data to a temporary file for streaming
+            with tempfile.NamedTemporaryFile(delete=False, dir=CONFIG_DIR) as temp_enc_file:
+                temp_encrypted_path = Path(temp_enc_file.name)
+                temp_enc_file.write(encrypted_data)
+            
+            logger.debug(f"Encrypted file written to temp: {temp_encrypted_path}, size: {encrypted_size} bytes")
+            self.progress.emit(10, f"Encrypted {filename}...") # Update progress after encryption
+            
+            with open(temp_encrypted_path, "rb") as f_encrypted:
+                progress_file_reader = self._progress_reader(f_encrypted, encrypted_size, start_progress=10) # Start progress from 10%
                 files = {
                     "file": (filename, progress_file_reader, "application/octet-stream")
                 }
@@ -273,7 +369,7 @@ class UploadWorker(QThread):
                 }
                 
                 try:
-                    self.progress.emit(0, "Starting upload...")
+                    self.progress.emit(10, "Starting upload...")
                     r = self._session.put(
                         f"https://{self.ip}:{self.port}/upload/{filename}",
                         files=files,
@@ -287,7 +383,7 @@ class UploadWorker(QThread):
                         
                     if r.ok:
                         response = r.json()
-                        logger.info(f"File uploaded successfully to {response['path']}")
+                        logger.info(f"Encrypted file uploaded successfully to {response['path']}")
                         self.progress.emit(100, "Upload complete")
                         self.finished.emit(True, f"File uploaded successfully to {response['path']}")
                     else:
@@ -312,10 +408,17 @@ class UploadWorker(QThread):
                     if not self._is_cancelled:
                         logger.error(f"Upload error: {str(e)}", exc_info=True)
                         self.finished.emit(False, f"Upload error: {str(e)}")
+        except ValueError as ve:
+            logger.error(f"Encryption error for {filename}: {ve}", exc_info=True)
+            self.finished.emit(False, f"Upload failed: Encryption error ({ve}).")
         except Exception as e:
             if not self._is_cancelled:
                 logger.error(f"Error preparing upload: {str(e)}", exc_info=True)
                 self.finished.emit(False, f"Error preparing upload: {str(e)}")
+        finally:
+            if temp_encrypted_path and temp_encrypted_path.exists():
+                os.unlink(temp_encrypted_path)
+                logger.debug(f"Cleaned up temporary encrypted file: {temp_encrypted_path}")
     
     def _validate_zip_file(self, zip_path):
         """Validate zip file integrity before upload"""
@@ -391,70 +494,71 @@ class UploadWorker(QThread):
             raise ValueError(f"Error creating relative path: {str(e)}")
 
     def _create_zip_file(self, source_path, temp_dir):
-        """Create zip file with improved error handling and progress tracking"""
+        """Create zip file with improved error handling and progress tracking, encrypting files."""
         zip_path = os.path.join(temp_dir, f"{Path(source_path).name}.zip")
         logger.debug(f"Creating zip file at: {zip_path}")
         
         try:
-            # Calculate total size and validate files first
             total_size = 0
             file_count = 0
             files_to_zip = []
             
             for root, _, files in os.walk(source_path):
-                for file in files:
+                for file_name in files: # Renamed 'file' to 'file_name' to avoid conflict with built-in
                     try:
-                        file_path = os.path.join(root, file)
+                        file_path = os.path.join(root, file_name)
                         if not os.path.exists(file_path):
                             continue
                             
-                        # Check file permissions
                         if not os.access(file_path, os.R_OK):
                             logger.warning(f"No read permission for file: {file_path}")
                             continue
                             
-                        # Get relative path and sanitize filename
-                        rel_path = self._get_relative_path(file_path, source_path)
-                        safe_name = self._sanitize_filename(rel_path)
-                        
-                        # Skip if path is invalid
-                        if '..' in safe_name or safe_name.startswith('/'):
-                            logger.warning(f"Skipping invalid path: {file_path}")
-                            continue
-                            
-                        file_size = os.path.getsize(file_path)
-                        total_size += file_size
+                        # Path within the zip, relative to the original folder's parent
+                        arcname = str(Path(file_path).relative_to(Path(source_path).parent)).replace("\\", "/") 
+
+                        # Note: original_file_size is used for progress calculation based on unencrypted data
+                        original_file_size = os.path.getsize(file_path)
+                        total_size += original_file_size 
                         file_count += 1
-                        files_to_zip.append((file_path, safe_name, file_size))
+                        files_to_zip.append((file_path, arcname, original_file_size))
                         
                     except (OSError, PermissionError) as e:
-                        logger.warning(f"Error accessing file {file}: {str(e)}")
+                        logger.warning(f"Error accessing file {file_name}: {str(e)}")
                         continue
             
             if file_count == 0:
                 raise ValueError("No valid files found to zip")
             
             # Create zip file with progress tracking
-            uploaded_size = 0
+            processed_original_size = 0
             with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, allowZip64=True) as zipf:
-                for file_path, safe_name, file_size in files_to_zip:
+                for file_path, arcname, original_file_size in files_to_zip:
                     if self._is_cancelled:
                         raise InterruptedError("Upload cancelled during zip creation")
                         
                     try:
-                        zipf.write(file_path, safe_name)
+                        # Read original file content
+                        with open(file_path, 'rb') as f_read:
+                            original_data = f_read.read()
+
+                        # Encrypt data
+                        encrypted_data = security_manager.encrypt_data(original_data)
                         
-                        # Update progress
-                        uploaded_size += file_size
-                        progress = int((uploaded_size / total_size) * 50)  # First 50% for zipping
-                        self.progress.emit(progress, f"Preparing folder: {progress}%")
+                        # Add encrypted data to the zip
+                        zipf.writestr(arcname, encrypted_data) # arcname is the path within the zip
+                        
+                        # Update progress based on original size for user clarity
+                        processed_original_size += original_file_size
+                        progress = int((processed_original_size / total_size) * 50)  # First 50% for zipping
+                        self.progress.emit(progress, f"Preparing folder (encrypting): {progress}%")
                         
                     except Exception as e:
-                        logger.warning(f"Error adding file {file_path} to zip: {str(e)}")
-                        continue
+                        logger.error(f"Error encrypting or adding file {file_path} to zip: {str(e)}", exc_info=True)
+                        raise # Re-raise to ensure error is handled
             
-            # Validate zip file before returning
-            self._validate_zip_file(zip_path)
+            # Validate zip file before returning (validation now applies to zip of encrypted files)
+            self._validate_zip_file(zip_path) 
             return zip_path
             
         except Exception as e:
@@ -476,9 +580,9 @@ class UploadWorker(QThread):
             logger.info(f"Starting folder upload: {folder_name}")
             
             # Create temporary directory for zip file
-            with tempfile.TemporaryDirectory() as temp_dir:
+            with tempfile.TemporaryDirectory(dir=CONFIG_DIR) as temp_dir: # Use CONFIG_DIR for temp
                 try:
-                    # Create and validate zip file
+                    # Create and validate zip file (now includes encryption)
                     zip_path = self._create_zip_file(self.source_path, temp_dir)
                     
                     # Upload zip file with improved retry logic
@@ -489,13 +593,12 @@ class UploadWorker(QThread):
                     
                     while retry_count < max_retries and not self._is_cancelled:
                         try:
-                            file_size = os.path.getsize(zip_path)
+                            file_size = os.path.getsize(zip_path) # This is the size of the *encrypted* zip
                             logger.info(f"Uploading zip file: {file_size} bytes")
                             
                             # Validate zip file before each attempt
                             self._validate_zip_file(zip_path)
                             
-                            # Configure session for streaming upload
                             session = requests.Session()
                             session.verify = False
                             
@@ -521,7 +624,8 @@ class UploadWorker(QThread):
                                 # Open file in binary mode for streaming
                                 with open(zip_path, 'rb') as f:
                                     # Create a streaming upload with progress tracking
-                                    progress_file_reader = self._progress_reader(f, file_size, 50)
+                                    # Progress starts from 50% because zipping/encryption took first 50%
+                                    progress_file_reader = self._progress_reader(f, file_size, 50) 
                                     
                                     self.progress.emit(50, "Starting folder upload...")
                                     
@@ -534,6 +638,7 @@ class UploadWorker(QThread):
                                     )
                                     
                                     if self._is_cancelled:
+                                        logger.info("Upload cancelled during transfer")
                                         raise InterruptedError("Upload cancelled during transfer")
                                         
                                     if r.ok:
@@ -548,16 +653,6 @@ class UploadWorker(QThread):
                                             try:
                                                 error_detail = r.json().get("detail", r.text)
                                                 error_msg += f" - {error_detail}"
-                                                
-                                                # Handle specific error cases
-                                                if "Invalid zip file" in error_detail:
-                                                    raise ValueError("Server rejected zip file: " + error_detail)
-                                                elif "Permission denied" in error_detail:
-                                                    raise PermissionError("Permission denied on server: " + error_detail)
-                                                elif "Path too long" in error_detail:
-                                                    raise ValueError("Path too long on server: " + error_detail)
-                                                elif "File upload incomplete" in error_detail:
-                                                    raise ConnectionError("Upload was incomplete: " + error_detail)
                                             except:
                                                 error_msg += f" - {r.text}"
                                                 
@@ -568,8 +663,8 @@ class UploadWorker(QThread):
                                     raise InterruptedError("Upload cancelled during transfer")
                                 raise
                                 
-                        except (ValueError, PermissionError, ConnectionError) as e:
-                            # These errors should not be retried
+                        except (ValueError, PermissionError, ConnectionError, InterruptedError) as e: # Added InterruptedError
+                            # These errors should not be retried, or are user-initiated cancel
                             raise
                         except Exception as e:
                             retry_count += 1
@@ -596,16 +691,16 @@ class UploadWorker(QThread):
             logger.info("Folder upload cancelled")
             self.finished.emit(False, "Upload cancelled by user")
         except ValueError as e:
-            logger.error(f"Validation error during upload: {str(e)}")
+            logger.error(f"Validation or Encryption error during folder upload: {str(e)}")
             self.finished.emit(False, f"Upload failed: {str(e)}")
         except PermissionError as e:
-            logger.error(f"Permission error during upload: {str(e)}")
+            logger.error(f"Permission error during folder upload: {str(e)}")
             self.finished.emit(False, f"Upload failed: {str(e)}")
         except TimeoutError as e:
-            logger.error(f"Timeout during upload: {str(e)}")
+            logger.error(f"Timeout during folder upload: {str(e)}")
             self.finished.emit(False, f"Upload failed: {str(e)}")
         except ConnectionError as e:
-            logger.error(f"Connection error during upload: {str(e)}")
+            logger.error(f"Connection error during folder upload: {str(e)}")
             self.finished.emit(False, f"Upload failed: {str(e)}")
         except Exception as e:
             if not self._is_cancelled:
@@ -629,12 +724,20 @@ class DownloadProcess(QObject):
         self._progress_update_interval = 0.1  # Update every 100ms
         
     def start_download(self, ip, port, token, items, download_dir, is_folder):
-        """Start the download process with improved error handling"""
+        """Start the download process with improved error handling, passing encryption key."""
         try:
             if self.is_running:
                 logger.warning("Download process already running")
                 return
-                
+            
+            # Get the encryption key from the main process's security_manager
+            encryption_key_bytes = security_manager.get_encryption_key()
+            if encryption_key_bytes is None:
+                raise ValueError("Encryption key is not loaded. Cannot download securely.")
+            
+            # Base64 encode the encryption key to pass it as a command-line argument
+            encryption_key_b64 = base64.b64encode(encryption_key_bytes).decode('utf-8')
+
             # Convert items to base64 encoded JSON
             items_json = json.dumps(items, ensure_ascii=False)
             items_b64 = base64.b64encode(items_json.encode('utf-8')).decode('utf-8')
@@ -649,10 +752,11 @@ class DownloadProcess(QObject):
                 token,
                 items_b64,
                 download_dir,
-                str(is_folder).lower()
+                str(is_folder).lower(),
+                encryption_key_b64 # NEW: Pass the encryption key here
             ]
             
-            logger.info(f"Starting download process with command: {' '.join(cmd)}")
+            logger.info(f"Starting download process with command (partial): {cmd[0]} {cmd[1]} ... (key omitted from log)")
             
             # Start process
             self.process.start(cmd[0], cmd[1:])
@@ -661,6 +765,11 @@ class DownloadProcess(QObject):
                 
             self.is_running = True
             
+        except ValueError as ve:
+            error_msg = f"Failed to start download: {ve}. (Security key missing?)"
+            logger.error(error_msg)
+            self.finished.emit(False, error_msg)
+            self.cleanup.emit()
         except Exception as e:
             error_msg = f"Failed to start download: {str(e)}"
             logger.error(error_msg)
@@ -823,14 +932,14 @@ class MainWindow(QWidget):
         super().__init__()
         logger.info("Initializing main window (MainWindow.__init__ start)")
         try:
-            self.setWindowTitle(settings.device_id)
-            self.setGeometry(100, 100, 1600, 800)
+            self.setWindowTitle("P2PShare")
+            self.setGeometry(100, 100, 1200, 800)
 
             # Initialize state with improved defaults
             self.discovery = PeerDiscovery(port=settings.http_port)
             self.peer_tokens = {}
             self.last_peer_check = {}
-            self.peer_check_timeout = 60  # Increased timeout to reduce auth requests # LINE 1259
+            self.peer_check_timeout = 60  # Increased timeout to reduce auth requests 
             self._operation_lock = threading.RLock()  # Use RLock instead of Lock for better deadlock prevention
             self.current_download = None
             self.current_worker = None
@@ -1123,16 +1232,6 @@ class MainWindow(QWidget):
             logger.critical(f"Error during MainWindow UI initialization (_init_ui): {str(e)}", exc_info=True)
             raise # Re-raise to propagate to __init__ and then main()
 
-    def _start_initial_tasks(self):
-        """Method to start tasks that rely on full MainWindow initialization."""
-        logger.info("MainWindow: Starting deferred initial tasks...")
-        self.update_peer_list()  # Initial update
-        logger.info("MainWindow: Initial update_peer_list() completed.")
-        self.timer.start(self.peer_update_interval * 1000) # Start periodic peer list updates
-        logger.info("MainWindow: Periodic peer list update timer started.")
-        self.peer_health_check_timer.start(10000) # Start periodic health checks
-        logger.info("MainWindow: Periodic peer health check timer started.")
-
     def navigate_back(self):
         """Navigate to the previous directory"""
         if self.path_history:
@@ -1228,6 +1327,14 @@ class MainWindow(QWidget):
             QMessageBox.warning(self, "No Items Selected", "Please select files or folders to download")
             return
             
+        # Check if encryption key is loaded before initiating download
+        if security_manager.get_encryption_key() is None:
+            QMessageBox.critical(self, "Security Error", 
+                                 "Encryption key not loaded. Cannot download/decrypt files securely.\n"
+                                 "Please ensure you've entered the correct security code on startup.")
+            logger.error("Download blocked: Encryption key not loaded.")
+            return
+
         # Reset cancellation flag
         self.is_operation_cancelled = False
             
@@ -1267,6 +1374,8 @@ class MainWindow(QWidget):
         progress.setMinimumDuration(0)
         progress.setAutoClose(False)
         progress.setAutoReset(False)
+        # Set minimum width for the progress dialog
+        progress.setMinimumWidth(400) # Set a fixed minimum width, e.g., 400 pixels
         progress.canceled.connect(self.cancel_download)
         
         # Store progress dialog
@@ -1285,6 +1394,7 @@ class MainWindow(QWidget):
         
         # Start the download
         is_folder = any(item.data(0, Qt.UserRole + 1) for item in selected_items)
+        # The encryption key will now be passed through the DownloadProcess
         download_process.start_download(ip, port, token, items, download_dir, is_folder)
 
     def update_download_progress(self, value, message):
@@ -1417,7 +1527,7 @@ class MainWindow(QWidget):
                         download_process.stop() # Use the new stop method
                     download_process.deleteLater() # Important for QObject cleanup
                 except Exception as e:
-                    logger.error(f"Error cleaning up download process: {str(e)}")
+                    logger.error(f"Error cleaning up download process in cleanup_download: {str(e)}")
                     
             self.is_operation_cancelled = False # Reset
             logger.debug("Download resources cleaned up.")
@@ -1432,6 +1542,14 @@ class MainWindow(QWidget):
             logger.warning("Upload attempted without selecting a peer")
             QMessageBox.warning(self, "No Peer Selected", 
                 "Please select a peer to upload to")
+            return
+
+        # Check if encryption key is loaded before initiating upload
+        if security_manager.get_encryption_key() is None:
+            QMessageBox.critical(self, "Security Error", 
+                                 "Encryption key not loaded. Cannot upload/encrypt files securely.\n"
+                                 "Please ensure you've entered the correct security code on startup.")
+            logger.error("Upload blocked: Encryption key not loaded.")
             return
 
         peer_text = selected.text()
@@ -1454,14 +1572,11 @@ class MainWindow(QWidget):
         msg_box.setText("Would you like to upload a single file?")
         msg_box.setInformativeText("Click 'Upload File' to upload a single file.\nClick 'Upload Folder' to upload a folder with all its contents.")
 
-        # Define custom buttons
         upload_file_button = msg_box.addButton("Upload File", QMessageBox.AcceptRole)
         upload_folder_button = msg_box.addButton("Upload Folder", QMessageBox.RejectRole)
         msg_box.setStandardButtons(QMessageBox.Cancel) # Add a Cancel button explicitly
 
         msg_box.setDefaultButton(upload_file_button) # Set 'Upload File' as default
-
-        # Show the message box and get the clicked button
         msg_box.exec_()
         
         clicked_button = msg_box.clickedButton()
@@ -1470,7 +1585,6 @@ class MainWindow(QWidget):
         if clicked_button == upload_folder_button:
             is_folder = True
         elif clicked_button == QMessageBox.Cancel:
-            # Handle cancellation if the user clicks 'Cancel'
             logger.info("Upload cancelled - dialog closed by user.")
             return # Exit the upload function early
 
@@ -1490,7 +1604,12 @@ class MainWindow(QWidget):
         logger.info(f"Selected source for upload: {source_path}")
 
         # Get destination path
-        dest_path = self.current_path
+        dialog = UploadDialog(self, is_folder)
+        if dialog.exec_() != QDialog.DialogCode.Accepted:
+            logger.info("Upload cancelled - no destination selected")
+            return
+            
+        dest_path = dialog.get_destination_path()
         logger.info(f"Selected destination path: {dest_path}")
 
         # Create and show progress dialog
@@ -1505,6 +1624,7 @@ class MainWindow(QWidget):
         progress.setMinimumDuration(0)
         progress.setAutoClose(False)
         progress.setAutoReset(False)
+        progress.setMinimumWidth(400) # Set a fixed minimum width, e.g., 400 pixels
         progress.canceled.connect(self.cancel_upload)
         
         # Store progress dialog
@@ -1649,7 +1769,7 @@ class MainWindow(QWidget):
             logger.critical(f"CRITICAL ERROR in _process_ui_updates: {str(e)}", exc_info=True)
             # Attempt to signal an error to the main thread or force exit if necessary
             # Note: Directly calling QApplication.quit() or sys.exit() from a timer callback
-            # can lead to recursive crashes or ungraceful shutdowns.
+            # can sometimes lead to recursive crashes or ungraceful shutdowns.
             # It's better to let the main loop handle the exit.
             QMessageBox.critical(self, "UI Update Error", f"A critical error occurred in UI updates: {str(e)}")
 
@@ -1753,14 +1873,11 @@ class MainWindow(QWidget):
             
             # Start final cleanup
             logger.info("Starting final cleanup within closeEvent...")
-            # QApplication.quit() is typically handled by sys.exit(app.exec_()) returning
-            # Avoid calling it directly here unless absolutely necessary for specific scenarios
             
         except Exception as e:
             logger.critical(f"CRITICAL ERROR during shutdown (closeEvent): {str(e)}", exc_info=True)
-            # Do not re-raise, let event.accept() handle it to avoid deeper crashes.
             QMessageBox.critical(self, "Shutdown Error", f"A critical error occurred during shutdown: {str(e)}")
-            event.ignore() # Potentially prevent closing if cleanup fails, or just let it crash
+            event.ignore() 
 
     def on_peer_selected(self, item):
         """Handle peer selection"""
@@ -1816,10 +1933,8 @@ class MainWindow(QWidget):
                         self.peers_list.addItem(item)
                         logger.info(f"Added new peer to list: {peer_text}")
                         
-                        # Start background online check (this is the call that was _check_peer_online)
-                        # The traceback indicated _check_peer_online_async was called here or in health check
-                        # Ensure it's called with the correct string type.
-                        QTimer.singleShot(0, lambda p_text_str=peer_text, p_ip=ip, p_pp=port: self._check_peer_online_async(p_text_str, p_ip, p_pp))
+                        # Start background online check
+                        QTimer.singleShot(0, lambda p_text_str=peer_text, p_ip=ip, p_port=port: self._check_peer_online_async(p_text_str, p_ip, p_port))
                     except Exception as e:
                         logger.error(f"Error adding peer {peer_text} to list: {str(e)}", exc_info=True)
                         continue
@@ -1846,11 +1961,8 @@ class MainWindow(QWidget):
                 "Failed to update peer list. Some peers may not be visible."
             ))
 
-    def _check_peer_online_async(self, peer_text: str, ip: str, port: int):
-        """
-        Starts a TokenFetcher thread to check peer online status and fetch token
-        without blocking the UI.
-        """
+    def _check_peer_online_async(self, peer_text: str, ip: str, port: int): 
+        """Check peer online status in background and update UI, designed to be called asynchronously."""
         logger.debug(f"Entering _check_peer_online_async for {peer_text}")
         try:
             # Ensure only one fetcher is active for a given peer_text
@@ -1967,15 +2079,15 @@ class MainWindow(QWidget):
         """Get or refresh token for a peer with improved reliability"""
         peer_addr = f"{ip}:{port}"
         # Reconstruct peer_text to match the key used in peer_connection_attempts and peer_last_success
-        peer_text = f"{settings.device_id} ({peer_addr})"
+        peer_text = f"{settings.device_id} ({peer_addr})" 
         current_time = datetime.now()
         
         try:
             # Check if we have a valid cached token
             if peer_addr in self.peer_tokens:
                 last_check = self.last_peer_check.get(peer_addr)
-                # LINE 1929: Error here
                 if last_check and (current_time - last_check).total_seconds() < self.peer_check_timeout:
+                    logger.debug(f"Using cached token for {peer_text}.")
                     return self.peer_tokens[peer_addr]
             
             # Check connection attempts
@@ -1983,7 +2095,7 @@ class MainWindow(QWidget):
             if attempts >= self.max_connection_attempts:
                 last_success = self.peer_last_success.get(peer_text) # Use peer_text for last_success
                 if not last_success or (current_time - last_success).total_seconds() < self.peer_retry_delay:
-                    logger.warning(f"Too many failed attempts for peer {peer_text}")
+                    logger.warning(f"Too many failed attempts for peer {peer_text}. Not attempting token fetch.")
                     QMessageBox.warning(
                         self, "Connection Error",
                         f"Too many failed connection attempts to {peer_text}. Please try again later."
@@ -1991,10 +2103,8 @@ class MainWindow(QWidget):
                     return None
             
             # --- Fallback to synchronous check if TokenFetcher hasn't provided info recently ---
-            # Ideally, get_peer_token should primarily read from peer_tokens populated by TokenFetcher.
-            # If a sync call is necessary (e.g., immediate action where async wasn't quick enough),
-            # then it would use the is_peer_online directly.
-            # For now, let's keep the existing sync logic as a fallback/direct attempt.
+            # This synchronous block should ideally be less frequent, relying more on async fetchers.
+            # However, for direct action (e.g., browse/download click), a synchronous attempt is okay.
 
             # Try to get a new token with retry logic
             session = requests.Session()
@@ -2009,6 +2119,7 @@ class MainWindow(QWidget):
             session.mount("https://", adapter)
             
             try:
+                logger.debug(f"Attempting synchronous token fetch for {peer_text}...")
                 r = session.post(
                     f"https://{ip}:{port}/auth",
                     json={"device_id": settings.device_id},
@@ -2023,12 +2134,12 @@ class MainWindow(QWidget):
                 self.peer_connection_attempts[peer_text] = 0 # Reset attempts
                 self.offline_peers.discard(peer_text)
                 
-                logger.debug(f"Successfully obtained token for {peer_text}")
+                logger.debug(f"Successfully obtained token for {peer_text} (synchronously).")
                 return token
                 
             except requests.exceptions.HTTPError as e:
-                self.peer_connection_attempts[peer_text] = attempts + 1 # Use peer_text for attempts
-                logger.warning(f"HTTP error getting token: {str(e)}")
+                self.peer_connection_attempts[peer_text] = attempts + 1 # Increment attempts
+                logger.warning(f"Synchronous HTTP error getting token from {peer_text}: {str(e)}")
                 QMessageBox.warning(
                     self, "Authentication Error",
                     f"Server returned an error: {e.response.status_code}"
@@ -2036,8 +2147,8 @@ class MainWindow(QWidget):
                 return None
                 
             except requests.exceptions.Timeout:
-                self.peer_connection_attempts[peer_text] = attempts + 1 # Use peer_text for attempts
-                logger.warning(f"Timeout getting token from {peer_text}")
+                self.peer_connection_attempts[peer_text] = attempts + 1 # Increment attempts
+                logger.warning(f"Synchronous Timeout getting token from {peer_text}")
                 QMessageBox.warning(
                     self, "Connection Timeout",
                     f"Connection to {peer_text} timed out. Please try again."
@@ -2045,8 +2156,8 @@ class MainWindow(QWidget):
                 return None
                 
             except requests.exceptions.ConnectionError:
-                self.peer_connection_attempts[peer_text] = attempts + 1 # Use peer_text for attempts
-                logger.warning(f"Connection error getting token from {peer_text}")
+                self.peer_connection_attempts[peer_text] = attempts + 1 # Increment attempts
+                logger.warning(f"Synchronous Connection error getting token from {peer_text}")
                 self.offline_peers.add(peer_text)
                 QMessageBox.warning(
                     self, "Connection Error",
@@ -2058,10 +2169,10 @@ class MainWindow(QWidget):
                 session.close()
                 
         except Exception as e:
-            logger.error(f"Error getting token from {peer_text}: {str(e)}", exc_info=True)
+            logger.error(f"Error in get_peer_token for {peer_text}: {str(e)}", exc_info=True)
             QMessageBox.warning(
                 self, "Authentication Error",
-                f"An unexpected error occurred: {str(e)}"
+                f"An unexpected error occurred during token retrieval: {str(e)}"
             )
             return None
 
@@ -2179,9 +2290,7 @@ class MainWindow(QWidget):
                 logger.debug(f"Removed {peer_text} from peers_list UI.")
             
             # Remove from tracking structures
-            # Extract ip:port from the full peer_text to use as key for self.peer_tokens and self.last_peer_check
             ip_port = peer_text.split("(")[-1].strip(")")
-            
             if ip_port in self.peer_tokens:
                 del self.peer_tokens[ip_port]
                 logger.debug(f"Removed {ip_port} from peer_tokens.")

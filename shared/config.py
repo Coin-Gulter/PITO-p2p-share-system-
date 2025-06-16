@@ -110,11 +110,7 @@ else:
     logger.info(f"Device ID saved to: {DEVICE_ID_FILE}")
 
 # Determine the HTTP port
-chosen_http_port = int(os.environ.get("HTTP_PORT", "0")) # Use 0 to indicate dynamic search if not set
-if chosen_http_port == 0: # If environment variable not set or set to 0
-    chosen_http_port = find_available_port(start_port=5000, end_port=6000)
-else:
-    logger.info(f"Using HTTP port from environment variable: {chosen_http_port}")
+chosen_http_port = find_available_port(start_port=5000, end_port=6000)
 
 
 settings = Settings(
