@@ -16,6 +16,7 @@ import zipfile
 import time
 from starlette.background import BackgroundTask
 import base64
+import platform # To detect OS for drive listing
 
 # Set up logger
 logger = setup_logger(__name__)
@@ -26,7 +27,7 @@ class AuthRequest(BaseModel):
 
 class FileInfo(BaseModel):
     name: str
-    path: str
+    path: str # This path will now be absolute (or drive-relative) from the client's perspective
     is_dir: bool
     size: Optional[int] = None
     modified: Optional[float] = None
@@ -39,18 +40,54 @@ class UploadResponse(BaseModel):
 SECRET_KEY = settings.device_id + settings.device_id[::-1]
 ALGORITHM = "HS256"
 app = FastAPI()
-app.state.SHARE_DIR = Path.home() / "P2PShare"
+# SHARE_DIR will no longer be a strict root, but kept for legacy or other uses if needed.
+# For full filesystem sharing, the effective root for browsing becomes the OS root or drive list.
+app.state.SHARE_DIR = Path.home() / "P2PShare" # Still create a default P2PShare dir, but it's not the only browsable root.
 security = HTTPBearer()
 
-def get_share_dir():
-    return app.state.SHARE_DIR
+# --- Security: Blacklisted paths (crucial for full filesystem sharing) ---
+# These are paths that should NEVER be exposed, even to authorized users.
+# Add more as needed based on your OS and security requirements.
+BLACKLISTED_PATHS = [
+    Path('/etc').resolve(), # Linux/macOS system configuration
+    Path('/bin').resolve(), # Linux/macOS binaries
+    Path('/sbin').resolve(), # Linux/macOS system binaries
+    Path('/dev').resolve(), # Linux/macOS device files
+    Path('/proc').resolve(), # Linux virtual filesystem
+    Path('/sys').resolve(), # Linux system information
+    Path('/boot').resolve(), # Linux boot files
+    Path('/root').resolve(), # Linux root user's home directory
+    Path('/usr').resolve(),  # Linux user programs
 
-# Re-expose SHARE_DIR at module level for backward compatibility
-SHARE_DIR = property(get_share_dir)
+    Path('C:/Windows').resolve(), # Windows system directory
+    Path('C:/Program Files').resolve(), # Program installation directory
+    Path('C:/Program Files (x86)').resolve(), # Program installation directory
+    Path('C:/PerfLogs').resolve(), # Performance logs
+    Path('C:/System Volume Information').resolve(), # System recovery information
+    Path('C:/$Recycle.Bin').resolve(), # Recycle bin
+    Path('C:/Users/Default').resolve(), # Default user profile
+    Path('C:/Users/Public').resolve(), # Public user files
+    # Add more specific sensitive user data paths if known, e.g., browser profiles, crypto wallets etc.
+    # For user specific sensitive data it's harder to blacklist without knowing all user profiles
+    # so relying on authentication and user trust becomes paramount.
+]
 
-# Create share directory if not exists
-os.makedirs(get_share_dir(), exist_ok=True)
-logger.info(f"Share directory initialized at {get_share_dir()}")
+# Ensure blacklisted paths are resolved once on startup for accurate comparison
+BLACKLISTED_PATHS = [p.resolve() for p in BLACKLISTED_PATHS if p.exists()]
+logger.info(f"Initialized blacklisted paths for full filesystem sharing: {BLACKLISTED_PATHS}")
+
+def is_path_blacklisted(p: Path) -> bool:
+    """Checks if a given path is blacklisted or within a blacklisted directory."""
+    resolved_p = p.resolve()
+    for blacklisted in BLACKLISTED_PATHS:
+        if resolved_p == blacklisted or resolved_p.is_relative_to(blacklisted):
+            logger.warning(f"Access to blacklisted path detected: {p} (resolved: {resolved_p}) is in {blacklisted}")
+            return True
+    return False
+
+# Create share directory if not exists (still useful for default uploads if not specifying elsewhere)
+os.makedirs(app.state.SHARE_DIR, exist_ok=True)
+logger.info(f"Default P2PShare directory initialized at {app.state.SHARE_DIR}")
 
 # --- Auth helpers ---
 def create_jwt(device_id):
@@ -77,213 +114,294 @@ async def ping():
     logger.debug("Received ping request")
     return {"status": "online", "device_id": settings.device_id}
 
+# The /files endpoint is still specific to the original SHARE_DIR
 @app.get("/files", dependencies=[Depends(require_auth)])
 def list_files():
-    """List visible files in the share directory"""
+    """List visible files in the original P2PShare directory only (legacy)."""
     try:
-        # Get all files in the directory
         files = []
         for f in get_share_dir().iterdir():
-            # Only include regular files (not directories) that are visible
-            # and are in the temp directory (to avoid listing system files)
             if (f.is_file() and 
                 not f.name.startswith('.') and 
                 not f.name.startswith('~') and
-                f.parent == get_share_dir()):  # Only list files directly in the share directory
+                f.parent == get_share_dir()):
                 try:
-                    # Check if file is readable
                     if os.access(f, os.R_OK):
                         files.append(f.name)
                 except Exception as e:
                     logger.warning(f"Error accessing file {f}: {str(e)}")
                     continue
-                    
-        logger.info(f"Listed {len(files)} files in share directory")
+        logger.info(f"Listed {len(files)} files in legacy share directory")
         return JSONResponse(files)
     except Exception as e:
         logger.error(f"Error listing files: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
-
+# The /files/{filename} endpoint is still specific to the original SHARE_DIR
 @app.get("/files/{filename}", dependencies=[Depends(require_auth)])
-def download_file(filename: str):
+def download_file_legacy(filename: str):
     file_path = get_share_dir() / filename
     if file_path.exists():
-        logger.info(f"File download requested: {filename}")
+        logger.info(f"Legacy file download requested: {filename}")
         return FileResponse(file_path)
-    logger.warning(f"File not found: {filename}")
+    logger.warning(f"Legacy file not found: {filename}")
     raise HTTPException(status_code=404, detail="File not found")
-
 
 @app.post("/auth")
 def auth(request: AuthRequest):
     logger.info(f"Authentication request from device: {request.device_id}")
     token = create_jwt(request.device_id)
-    return {"token": token}
+    return {"access_token": token}
 
-def get_file_info(path: Path) -> FileInfo:
-    """Get information about a file or directory"""
+def get_file_info_for_client(full_item_path: Path) -> FileInfo:
+    """
+    Get information about a file or directory for client display.
+    The 'path' in FileInfo will be the full absolute path with forward slashes.
+    """
     try:
-        stat_info = path.stat()
+        stat_info = full_item_path.stat()
+        
+        # Ensure path is always presented with forward slashes for cross-platform consistency
+        client_display_path = full_item_path.as_posix()
+        
+        # On Windows, for drive roots, Path('/').as_posix() returns '/'.
+        # For 'C:/', Path('C:/').as_posix() returns 'C:/'.
+        # For consistency, when browsing root, we want to see 'C:/', 'D:/' etc.
+        # So we can keep it as is.
+        if platform.system() == "Windows" and full_item_path.drive and not full_item_path.root:
+            # This is a drive root like C: or D:. Path().as_posix() handles this as 'C:/'.
+            pass
+        elif platform.system() == "Windows" and not full_item_path.is_absolute():
+            # This case ideally should not happen with resolved paths
+            pass
+
         return FileInfo(
-            name=path.name,
-            path=str(path),
-            is_dir=path.is_dir(),
-            size=stat_info.st_size if path.is_file() else None,
+            name=full_item_path.name if full_item_path.name else str(full_item_path).replace(':', ''), # Name for drive root e.g. C or D
+            path=client_display_path, # Full absolute path
+            is_dir=full_item_path.is_dir(),
+            size=stat_info.st_size if full_item_path.is_file() else None,
             modified=stat_info.st_mtime
         )
     except Exception as e:
-        logger.error(f"Error getting file info for {path}: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error getting file info for {full_item_path}: {str(e)}", exc_info=True)
+        # Instead of raising HTTPException here, let list_directory handle skipping.
+        raise
 
 @app.get("/browse", dependencies=[Depends(require_auth)])
 def list_directory(path: str = Query("/", description="Directory path to list")):
-    """List contents of a directory"""
+    """
+    List contents of a directory.
+    When path is "/", lists available drives on Windows or root directory contents on Unix-like systems.
+    Otherwise, lists contents of the specified absolute path.
+    """
     try:
-        # Convert to absolute path and normalize
-        abs_path = Path(path).resolve()
-        
-        # Security check: prevent directory traversal
-        if not abs_path.exists():
-            raise HTTPException(status_code=404, detail="Directory not found")
+        target_path: Path
+
+        if path == "/":
+            if platform.system() == "Windows":
+                # On Windows, list drive letters
+                drive_letters = []
+                for drive in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+                    drive_path = Path(f"{drive}:/")
+                    if drive_path.exists() and drive_path.is_dir():
+                        drive_letters.append(drive_path)
+                
+                items = []
+                for drive_p in drive_letters:
+                    if is_path_blacklisted(drive_p):
+                        logger.warning(f"Skipping blacklisted drive: {drive_p}")
+                        continue
+                    try:
+                        # For drives, the 'name' in FileInfo should be just the drive letter (e.g., 'C').
+                        # The 'path' should be 'C:/'
+                        items.append(get_file_info_for_client(drive_p))
+                    except Exception as e:
+                        logger.warning(f"Error getting info for drive {drive_p}: {e}")
+                        continue # Skip problematic drives
+                logger.info(f"Listed available drives: {len(items)} items")
+                return items
+            else:
+                # On Unix-like systems, list contents of '/'
+                target_path = Path('/')
+        else:
+            # For non-root requests, assume path is an absolute path.
+            # Convert to Path and resolve to handle '..' etc.
+            target_path = Path(path).resolve()
+
+        # Security checks for any requested path (including subdirectories of drives on Windows)
+        if not target_path.exists():
+            raise HTTPException(status_code=404, detail=f"Path not found: {path}")
             
-        if not abs_path.is_dir():
-            raise HTTPException(status_code=400, detail="Path is not a directory")
+        if not target_path.is_dir():
+            raise HTTPException(status_code=400, detail=f"Path is not a directory: {path}")
+
+        if is_path_blacklisted(target_path):
+            raise HTTPException(status_code=403, detail="Access to this path is restricted.")
             
-        # List directory contents
         items = []
-        for item in abs_path.iterdir():
+        for item in target_path.iterdir():
+            if is_path_blacklisted(item):
+                logger.warning(f"Skipping blacklisted item: {item}")
+                continue
             try:
-                items.append(get_file_info(item))
+                # Check read permissions before trying to get info
+                if os.access(item, os.R_OK):
+                    items.append(get_file_info_for_client(item))
+                else:
+                    logger.warning(f"No read permission for item: {item}. Skipping.")
+            except PermissionError:
+                logger.warning(f"Permission denied for item: {item}. Skipping.")
             except Exception as e:
-                logger.warning(f"Error getting info for {item}: {str(e)}")
+                logger.warning(f"Error getting info for {item}: {str(e)}. Skipping. Trace: {e.__class__.__name__}")
+                # Continue processing other items even if one fails
                 continue
                 
-        logger.info(f"Listed directory: {path} ({len(items)} items)")
+        logger.info(f"Listed directory: {path} (resolved to {target_path}, {len(items)} items)")
         return items
     except HTTPException:
-        raise
+        raise # Re-raise FastAPI HTTPExceptions directly
     except Exception as e:
         logger.error(f"Error listing directory {path}: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Error listing directory: {str(e)}")
+
 
 @app.get("/file-info", dependencies=[Depends(require_auth)])
 def get_file_info_endpoint(path: str = Query(..., description="Path to get info for")):
-    """Get information about a specific file or directory"""
+    """Get information about a specific file or directory (full absolute path)"""
     try:
-        abs_path = Path(path).resolve()
-        if not abs_path.exists():
-            raise HTTPException(status_code=404, detail="File not found")
-        return get_file_info(abs_path)
+        effective_path = Path(path).resolve()
+
+        if not effective_path.exists():
+            raise HTTPException(status_code=404, detail="File or directory not found")
+        
+        if is_path_blacklisted(effective_path):
+            raise HTTPException(status_code=403, detail="Access to this path is restricted.")
+
+        return get_file_info_for_client(effective_path)
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error getting file info for {path}: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Error getting file info: {str(e)}")
 
 @app.get("/download", dependencies=[Depends(require_auth)])
 def download_file(path: str = Query(..., description="Path of file to download")):
-    """Download a file from any location"""
+    """Download a file from any absolute location"""
     try:
-        file_path = Path(path).resolve()
-        if not file_path.exists():
+        effective_path = Path(path).resolve()
+
+        if not effective_path.exists():
             raise HTTPException(status_code=404, detail="File not found")
-        if not file_path.is_file():
+        if not effective_path.is_file():
             raise HTTPException(status_code=400, detail="Path is not a file")
+        
+        if is_path_blacklisted(effective_path):
+            raise HTTPException(status_code=403, detail="Access to this path is restricted.")
             
-        logger.info(f"File download requested: {path}")
+        # Check read permissions
+        if not os.access(effective_path, os.R_OK):
+            raise HTTPException(status_code=403, detail="Permission denied to read file.")
+
+        logger.info(f"File download requested: {path} (resolved to {effective_path})")
         return FileResponse(
-            file_path,
-            filename=file_path.name,
+            effective_path, # Use the resolved and validated path
+            filename=effective_path.name,
             media_type='application/octet-stream'
         )
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error downloading file {path}: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Error downloading file: {str(e)}")
 
 @app.get("/download-folder", dependencies=[Depends(require_auth)])
 def download_folder(path: str = Query(..., description="Path of folder to download")):
-    """Download a folder as a zip file"""
+    """Download a folder as a zip file from any absolute location"""
     temp_dir = None
+    zip_path = None
     try:
-        # Log the incoming request
         logger.info(f"Folder download requested for path: {path}")
         
-        # Convert to absolute path and normalize
-        try:
-            folder_path = Path(path).resolve()
-            logger.debug(f"Resolved path to: {folder_path}")
-        except Exception as e:
-            logger.error(f"Failed to resolve path {path}: {str(e)}", exc_info=True)
-            raise HTTPException(status_code=400, detail=f"Invalid path: {str(e)}")
-        
-        # Check if path exists and is a directory
-        if not folder_path.exists():
-            logger.warning(f"Folder not found: {folder_path}")
+        effective_path = Path(path).resolve()
+
+        if not effective_path.exists():
+            logger.warning(f"Folder not found: {effective_path}")
             raise HTTPException(status_code=404, detail="Folder not found")
-        if not folder_path.is_dir():
-            logger.warning(f"Path is not a folder: {folder_path}")
+        if not effective_path.is_dir():
+            logger.warning(f"Path is not a folder: {effective_path}")
             raise HTTPException(status_code=400, detail="Path is not a folder")
             
-        # Check if we have read permissions
-        try:
-            os.access(folder_path, os.R_OK)
-        except Exception as e:
-            logger.error(f"No read permission for folder {folder_path}: {str(e)}", exc_info=True)
-            raise HTTPException(status_code=403, detail="No permission to read folder")
+        if is_path_blacklisted(effective_path):
+            raise HTTPException(status_code=403, detail="Access to this path is restricted.")
             
-        # Create a temporary directory for the zip file
-        try:
-            temp_dir = tempfile.mkdtemp()
-            logger.debug(f"Created temporary directory: {temp_dir}")
-        except Exception as e:
-            logger.error(f"Failed to create temporary directory: {str(e)}", exc_info=True)
-            raise HTTPException(status_code=500, detail="Failed to create temporary directory")
+        if not os.access(effective_path, os.R_OK):
+            raise HTTPException(status_code=403, detail="Permission denied to read folder.")
             
-        # Create zip file name using folder name and timestamp
-        zip_filename = f"{folder_path.name}_{int(time.time())}.zip"
+        temp_dir = tempfile.mkdtemp()
+        logger.debug(f"Created temporary directory: {temp_dir}")
+            
+        # If zipping a drive root (e.g., C:/), its name is empty. Use drive letter.
+        # Otherwise, use the folder's name.
+        folder_name_for_zip = effective_path.name if effective_path.name else effective_path.drive.replace(':', '')
+        zip_filename = f"{folder_name_for_zip}_{int(time.time())}.zip"
         zip_path = Path(temp_dir) / zip_filename
         logger.info(f"Creating zip file: {zip_path}")
         
-        # Create zip file
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
             # Walk through the directory
-            for root, dirs, files in os.walk(folder_path):
-                try:
-                    # Get relative path for files in zip, including the parent folder name
-                    rel_path = Path(root).relative_to(folder_path.parent)
-                    logger.debug(f"Processing directory: {rel_path}")
-                    
-                    # Add files to zip
-                    for file in files:
-                        try:
-                            file_path = Path(root) / file
-                            # Check if file is readable
-                            if not os.access(file_path, os.R_OK):
-                                logger.warning(f"No read permission for file: {file_path}")
-                                continue
-                                
-                            # Add file to zip with relative path including parent folder
-                            zipf.write(file_path, rel_path / file)
-                            logger.debug(f"Added to zip: {file_path}")
-                        except Exception as e:
-                            logger.warning(f"Failed to add file {file} to zip: {str(e)}")
-                            continue
-                except Exception as e:
-                    logger.warning(f"Failed to process directory {root}: {str(e)}")
+            for root, dirs, files in os.walk(effective_path):
+                # Calculate path relative to the effective_path being zipped
+                # Example: effective_path = C:/my_folder, root = C:/my_folder/sub
+                # relative_to_zip_base = sub
+                # If effective_path is C:/, root is C:/Program Files, relative_to_zip_base = Program Files
+                current_item_path = Path(root)
+                
+                # Security: Check if current item path in walk is blacklisted
+                if is_path_blacklisted(current_item_path):
+                    logger.warning(f"Skipping blacklisted directory during zip: {current_item_path}")
+                    # Remove blacklisted dirs from 'dirs' list to prevent os.walk from entering them
+                    dirs[:] = [] 
                     continue
+
+                try:
+                    # Calculate relative path from the original folder being zipped to include in zip archive.
+                    # On Windows, if zipping a drive root (e.g. C:/), relative_to('') would fail.
+                    # We need to explicitly handle the archive name.
+                    if effective_path.is_absolute() and not effective_path.name: # It's a drive root like C:/
+                        # The base inside the zip will be the drive letter (e.g., C)
+                        relative_to_zip_base = Path(effective_path.drive.replace(':', '')) / Path(root).relative_to(effective_path)
+                    else:
+                        relative_to_zip_base = Path(root).relative_to(effective_path)
+                    
+                    logger.debug(f"Processing directory for zip: {root} -> Archive path: {relative_to_zip_base}")
+                    
+                    for file in files:
+                        file_path = Path(root) / file
+                        if is_path_blacklisted(file_path):
+                            logger.warning(f"Skipping blacklisted file during zip: {file_path}")
+                            continue
+                            
+                        if not os.access(file_path, os.R_OK):
+                            logger.warning(f"No read permission for file: {file_path}. Skipping.")
+                            continue
+                            
+                        # The name in the archive should be the base archive path + relative filename
+                        arcname = relative_to_zip_base / file_path.name
+                        zipf.write(file_path, arcname.as_posix()) # Use as_posix() for zip compatibility
+                        logger.debug(f"Added to zip: {file_path} as {arcname}")
+                except PermissionError:
+                    logger.warning(f"Permission denied to access {root}. Skipping contents.")
+                    dirs[:] = [] # Skip further traversal into this directory
+                    continue
+                except Exception as e:
+                    logger.warning(f"Failed to add file/directory to zip during walk {root}: {str(e)}")
+                    continue # Try to continue zipping other files
         
         logger.info(f"Zip file created successfully: {zip_path}")
         
-        # Check if zip file was created and is readable
-        if not zip_path.exists():
-            raise HTTPException(status_code=500, detail="Failed to create zip file")
-        if not os.access(zip_path, os.R_OK):
-            raise HTTPException(status_code=500, detail="No permission to read zip file")
+        if not zip_path.exists() or not os.access(zip_path, os.R_OK):
+            raise HTTPException(status_code=500, detail="Failed to create or read zip file")
             
-        # Create a custom response that will clean up the temp directory after sending
         def cleanup_after_send():
             try:
                 if temp_dir and os.path.exists(temp_dir):
@@ -292,12 +410,11 @@ def download_folder(path: str = Query(..., description="Path of folder to downlo
             except Exception as e:
                 logger.warning(f"Failed to clean up temporary directory {temp_dir}: {str(e)}")
                 
-        # Return the zip file with cleanup callback
         response = FileResponse(
             zip_path,
             filename=zip_filename,
             media_type='application/zip',
-            background=BackgroundTask(cleanup_after_send)  # Clean up after sending
+            background=BackgroundTask(cleanup_after_send)
         )
         return response
             
@@ -306,6 +423,8 @@ def download_folder(path: str = Query(..., description="Path of folder to downlo
         if temp_dir and os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
         raise HTTPException(status_code=500, detail="Failed to create zip file")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error creating zip file: {str(e)}", exc_info=True)
         if temp_dir and os.path.exists(temp_dir):
@@ -318,33 +437,37 @@ async def upload_file(
     file: UploadFile = File(...),
     dest_path: str = Form(...)
 ):
-    """Upload a file to a specific path"""
+    """Upload a file to a specific absolute path"""
     try:
-        # Validate filename
         if not filename or not isinstance(filename, str):
             raise HTTPException(status_code=400, detail="Invalid filename")
             
-        # Sanitize filename
         safe_filename = "".join(c for c in filename if c.isalnum() or c in "._- ")
         if not safe_filename:
             raise HTTPException(status_code=400, detail="Invalid filename after sanitization")
             
         # Convert destination path to absolute path
-        try:
-            dest_path = Path(dest_path).resolve()
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Invalid destination path: {str(e)}")
-        
-        # Security check: ensure destination is within allowed paths
-        if not dest_path.exists():
+        effective_dest_path = Path(dest_path).resolve()
+
+        # Security check: disallow upload to blacklisted paths
+        if is_path_blacklisted(effective_dest_path):
+            raise HTTPException(status_code=403, detail="Cannot upload to a restricted system path.")
+
+        # Check for traversal using '..' after resolve to be safe, though resolve typically handles this.
+        if ".." in effective_dest_path.parts:
+            raise HTTPException(status_code=400, detail="Path traversal (..) not allowed in destination.")
+
+        if not effective_dest_path.exists():
             raise HTTPException(status_code=404, detail="Destination directory not found")
-        if not dest_path.is_dir():
+        if not effective_dest_path.is_dir():
             raise HTTPException(status_code=400, detail="Destination path is not a directory")
             
-        # Create full destination path
-        full_path = dest_path / safe_filename
+        # Check write permissions for the destination directory
+        if not os.access(effective_dest_path, os.W_OK):
+            raise HTTPException(status_code=403, detail="Permission denied to write to destination directory.")
+
+        full_path = effective_dest_path / safe_filename
         
-        # Check if file already exists
         if full_path.exists():
             raise HTTPException(
                 status_code=400,
@@ -353,7 +476,6 @@ async def upload_file(
             
         logger.info(f"Uploading file to: {full_path}")
         
-        # Get file size from content-length header
         content_length = file.headers.get('content-length')
         if content_length:
             try:
@@ -365,7 +487,6 @@ async def upload_file(
         else:
             file_size = None
             
-        # Save the file with progress tracking
         try:
             with open(full_path, "wb") as out_file:
                 chunk_size = 8192 * 4  # 32KB chunks
@@ -376,7 +497,6 @@ async def upload_file(
                     out_file.write(chunk)
                     total_written += len(chunk)
                     
-                    # Log progress every 10%
                     if file_size and total_written - last_log >= file_size * 0.1:
                         progress = int((total_written / file_size) * 100)
                         logger.debug(f"Upload progress: {progress}%")
@@ -389,7 +509,6 @@ async def upload_file(
                 message="File uploaded successfully"
             )
         except Exception as e:
-            # Clean up partial file on error
             try:
                 if full_path.exists():
                     full_path.unlink()
@@ -409,9 +528,11 @@ async def upload_folder(
     dest_path: str = Header(..., alias="X-Dest-Path"),
     folder_name: str = Header(..., alias="X-Folder-Name")
 ):
-    """Upload and extract a folder from a zip file using raw streaming"""
+    """Upload and extract a folder from a zip file to a specific absolute path"""
     temp_dir = None
     zip_path = None
+    full_path = None # Initialize full_path for cleanup in case of early error
+
     try:
         # Decode base64 headers
         try:
@@ -425,27 +546,32 @@ async def upload_folder(
         if not folder_name or not isinstance(folder_name, str):
             raise HTTPException(status_code=400, detail="Invalid folder name")
             
-        # Sanitize folder name
         safe_folder_name = "".join(c for c in folder_name if c.isalnum() or c in "._- ")
         if not safe_folder_name:
             raise HTTPException(status_code=400, detail="Invalid folder name after sanitization")
             
         # Convert destination path to absolute path
-        try:
-            dest_path = Path(dest_path).resolve()
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Invalid destination path: {str(e)}")
-            
-        # Security check: ensure destination is within allowed paths
-        if not dest_path.exists():
+        effective_dest_path = Path(dest_path).resolve()
+
+        # Security check: disallow upload to blacklisted paths
+        if is_path_blacklisted(effective_dest_path):
+            raise HTTPException(status_code=403, detail="Cannot upload to a restricted system path.")
+
+        # Check for traversal using '..' after resolve
+        if ".." in effective_dest_path.parts:
+            raise HTTPException(status_code=400, detail="Path traversal (..) not allowed in destination.")
+
+        if not effective_dest_path.exists():
             raise HTTPException(status_code=404, detail="Destination directory not found")
-        if not dest_path.is_dir():
+        if not effective_dest_path.is_dir():
             raise HTTPException(status_code=400, detail="Destination path is not a directory")
             
-        # Create full destination path
-        full_path = dest_path / safe_folder_name
+        # Check write permissions for the destination directory
+        if not os.access(effective_dest_path, os.W_OK):
+            raise HTTPException(status_code=403, detail="Permission denied to write to destination directory.")
+            
+        full_path = effective_dest_path / safe_folder_name # Set full_path here
         
-        # Check if folder already exists
         if full_path.exists():
             raise HTTPException(
                 status_code=400,
@@ -454,13 +580,11 @@ async def upload_folder(
             
         logger.info(f"Uploading folder to: {full_path}")
         
-        # Get file size from content-length header
         content_length = request.headers.get('content-length')
         if content_length:
             try:
                 file_size = int(content_length)
                 logger.info(f"Zip file size: {file_size} bytes")
-                # Check if file is too large (e.g., 2TB)
                 if file_size > 2 * 1024 * 1024 * 1024 * 1024: # 2TB, effectively unlimited for most purposes
                     raise HTTPException(status_code=400, detail="Zip file exceeds maximum size limit of 2TB")
             except ValueError:
@@ -469,20 +593,16 @@ async def upload_folder(
         else:
             file_size = None
             
-        # Create temporary directory for the upload
         temp_dir = tempfile.mkdtemp()
         zip_path = Path(temp_dir) / f"{safe_folder_name}.zip"
         logger.debug(f"Creating temporary zip file at: {zip_path}")
         
-        # Save zip file with progress tracking and proper streaming
         try:
             with open(zip_path, "wb") as out_file:
                 chunk_size = 1024 * 1024  # 1MB chunks for better performance
                 total_written = 0
-                last_log = 0
                 last_progress = 0
                 
-                # Read file in chunks until EOF
                 async for chunk in request.stream():
                     if not chunk:  # EOF
                         break
@@ -490,14 +610,12 @@ async def upload_folder(
                     out_file.write(chunk)
                     total_written += len(chunk)
                     
-                    # Log progress every 5%
                     if file_size:
                         current_progress = int((total_written / file_size) * 100)
                         if current_progress - last_progress >= 5:
                             logger.debug(f"Upload progress: {current_progress}% ({total_written}/{file_size} bytes)")
                             last_progress = current_progress
                             
-            # Verify file was completely written
             if file_size and total_written != file_size:
                 raise HTTPException(
                     status_code=400,
@@ -506,7 +624,6 @@ async def upload_folder(
                 
             logger.info(f"Zip file upload complete: {total_written} bytes written")
             
-            # Verify the file exists and has content
             if not zip_path.exists() or zip_path.stat().st_size == 0:
                 raise HTTPException(
                     status_code=400,
@@ -519,15 +636,12 @@ async def upload_folder(
             
         # Validate zip file before extraction
         try:
-            # First check if file exists and has content
             if not zip_path.exists():
                 raise HTTPException(status_code=400, detail="Zip file not found after upload")
             if zip_path.stat().st_size == 0:
                 raise HTTPException(status_code=400, detail="Uploaded file is empty")
                 
-            # Try to open as zip file
             with zipfile.ZipFile(zip_path, 'r') as zipf:
-                # Test zip file integrity
                 test_result = zipf.testzip()
                 if test_result is not None:
                     raise HTTPException(
@@ -535,30 +649,24 @@ async def upload_folder(
                         detail=f"Zip file integrity check failed at: {test_result}"
                     )
                 
-                # Check if zip file is not empty
                 if not zipf.namelist():
                     raise HTTPException(status_code=400, detail="Zip file is empty")
                 
-                # Validate zip contents
                 for name in zipf.namelist():
-                    # Convert backslashes to forward slashes for consistency
                     name = name.replace('\\', '/')
                     
-                    # Check for absolute paths
                     if name.startswith('/') or name.startswith('\\'):
                         raise HTTPException(
                             status_code=400,
                             detail=f"Invalid path in zip: {name} (contains absolute path)"
                         )
                     
-                    # Check for parent directory references
-                    if '..' in name.split('/'):
+                    if '..' in Path(name).parts: # Using Path.parts for robustness
                         raise HTTPException(
                             status_code=400,
                             detail=f"Invalid path in zip: {name} (contains parent directory reference)"
                         )
                     
-                    # Check for invalid characters
                     invalid_chars = '<>:"|?*'
                     if any(char in name for char in invalid_chars):
                         raise HTTPException(
@@ -566,41 +674,30 @@ async def upload_folder(
                             detail=f"Invalid characters in filename: {name}"
                         )
                     
-                    # Check for maximum path length (Windows limit)
                     if len(name) > 260:
                         raise HTTPException(
                             status_code=400,
                             detail=f"Path too long: {name}"
                         )
                 
-                # Create destination directory
                 full_path.mkdir(parents=True, exist_ok=True)
                 
-                # Extract files with progress tracking
                 total_files = len(zipf.namelist())
                 for i, name in enumerate(zipf.namelist()):
                     try:
-                        # Convert path separators for Windows
                         safe_name = name.replace('\\', '/')
-                        
-                        # Calculate target path
                         target_path = full_path / safe_name
-                        
-                        # Ensure parent directory exists
                         target_path.parent.mkdir(parents=True, exist_ok=True)
                         
-                        # Extract file
                         with zipf.open(name) as source, open(target_path, 'wb') as target:
                             shutil.copyfileobj(source, target)
                         
-                        # Log progress every 10 files
                         if (i + 1) % 10 == 0:
                             progress = int(((i + 1) / total_files) * 100)
                             logger.debug(f"Extraction progress: {progress}%")
                             
                     except Exception as e:
                         logger.error(f"Error extracting {name}: {str(e)}")
-                        # Clean up partial extraction
                         if full_path.exists():
                             shutil.rmtree(full_path)
                         raise HTTPException(
@@ -625,7 +722,6 @@ async def upload_folder(
         )
         
     except HTTPException:
-        # Clean up partial folder on error
         if full_path and full_path.exists():
             try:
                 shutil.rmtree(full_path)
@@ -634,7 +730,6 @@ async def upload_folder(
         raise
     except Exception as e:
         logger.error(f"Error uploading folder: {str(e)}", exc_info=True)
-        # Clean up partial folder on error
         if full_path and full_path.exists():
             try:
                 shutil.rmtree(full_path)
@@ -642,7 +737,6 @@ async def upload_folder(
                 logger.error(f"Error cleaning up partial folder: {str(cleanup_error)}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        # Clean up temporary directory and zip file
         if temp_dir and os.path.exists(temp_dir):
             try:
                 if zip_path and zip_path.exists():

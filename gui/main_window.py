@@ -1,1067 +1,174 @@
-# p2pshare/gui/main_window.py
-
 import time
 import os
-from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QLabel,
-                             QPushButton, QListWidget, QListWidgetItem, QFileDialog,
-                             QHBoxLayout, QMessageBox, QTreeWidget, QTreeWidgetItem,
-                             QSplitter, QCheckBox, QProgressBar, QLineEdit, QToolBar,
-                             QDialog, QProgressDialog, QFormLayout, QInputDialog) # Added QInputDialog
-from PyQt5.QtCore import QTimer, Qt, QSize, pyqtSignal, QThread, QProcess, QObject
-from PyQt5.QtGui import QIcon, QFont
 import sys
 import requests
-from shared.discovery import PeerDiscovery
-from shared.config import settings, CONFIG_DIR # Import CONFIG_DIR
-from shared.security_manager import SecurityManager # Import SecurityManager class
-from shared.logging_config import setup_logger # Import setup_logger
 import threading
 import json
 from pathlib import Path
 from datetime import datetime
-import zipfile
-import tempfile
-import shutil
-import multiprocessing
-import base64
+import platform # To detect OS for drive listing
 
-# Set up logger
+from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QLabel,
+                             QPushButton, QListWidget, QListWidgetItem, QFileDialog,
+                             QHBoxLayout, QMessageBox, QTreeWidget, QTreeWidgetItem,
+                             QSplitter, QCheckBox, QProgressBar, QLineEdit, QToolBar,
+                             QDialog, QProgressDialog, QFormLayout, QInputDialog)
+from PyQt5.QtCore import QTimer, Qt, QSize, pyqtSignal, QThread, QProcess, QObject, QEvent
+from PyQt5.QtGui import QIcon, QFont
+
+# Import separated GUI components
+from gui.widgets import FileBrowser, SecuritySettingsDialog, UploadDialog
+from gui.workers import UploadWorker, DownloadProcess, TokenFetcher # ProgressFileReader is utility for workers removed from here
+
+# Import shared backend components
+from shared.discovery import PeerDiscovery
+from shared.config import settings, CONFIG_DIR
+from shared.security_manager import SecurityManager
+from shared.logging_config import setup_logger
+
+# Set up logger for this module
 logger = setup_logger(__name__)
 
-# Global Security Manager instance (from main.py)
-# It's assumed that main.py has already initialized and loaded the key into this instance
-security_manager = SecurityManager(CONFIG_DIR) # Re-instantiate here, but main.py sets the key.
-
-
-class FileBrowser(QTreeWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setHeaderLabels(["Name", "Size", "Modified"])
-        self.setSelectionMode(QTreeWidget.ExtendedSelection)
-        self.setColumnWidth(0, 300)  # Name column
-        self.setColumnWidth(1, 100)  # Size column
-        self.setColumnWidth(2, 150)  # Modified column
-        
-    def format_size(self, size):
-        """Format file size in human readable format"""
-        if size is None:
-            return ""
-        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-            if size < 1024:
-                return f"{size:.1f} {unit}"
-            size /= 1024
-        return f"{size:.1f} PB"
-        
-    def format_date(self, timestamp):
-        """Format timestamp to readable date"""
-        if timestamp is None:
-            return ""
-        return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
-
-
-class SecuritySettingsDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Security Settings")
-        self.setFixedSize(400, 200) # Fixed size for simplicity
-        
-        layout = QFormLayout()
-
-        self.hash_label = QLabel("Stored Hash (Base64):")
-        self.hash_value = QLineEdit()
-        self.hash_value.setReadOnly(True)
-        self.hash_value.setPlaceholderText("Not set or unavailable")
-        layout.addRow(self.hash_label, self.hash_value)
-
-        # Get and display the current hash
-        stored_hash = security_manager.get_stored_hash_b64()
-        if stored_hash:
-            self.hash_value.setText(stored_hash)
-        
-        self.change_password_button = QPushButton("Change Security Code")
-        self.change_password_button.clicked.connect(self._change_password_dialog)
-        layout.addRow(self.change_password_button)
-
-        self.setLayout(layout)
-
-    def _change_password_dialog(self):
-        """Handles the 'Change Security Code' process."""
-        if not security_manager.is_initialized():
-            QMessageBox.warning(self, "Security", "Security is not initialized. Please restart to set it up.")
-            return
-
-        old_password, ok = QInputDialog.getText(self, "Change Security Code",
-                                                "Enter your OLD security code:",
-                                                QLineEdit.Password)
-        if not ok or not old_password:
-            return
-
-        # Verify old password
-        if not security_manager.load_security(old_password): # Temporarily load to verify
-            QMessageBox.warning(self, "Incorrect Old Code", "The old security code you entered is incorrect.")
-            return
-
-        # Prompt for new password
-        while True:
-            new_password, ok_new = QInputDialog.getText(self, "Change Security Code",
-                                                        "Enter your NEW security code:",
-                                                        QLineEdit.Password)
-            if not ok_new or not new_password:
-                QMessageBox.warning(self, "Invalid New Code", "New security code cannot be empty.")
-                return
-
-            confirm_password, ok_confirm = QInputDialog.getText(self, "Change Security Code",
-                                                                "Confirm your NEW security code:",
-                                                                QLineEdit.Password)
-            if not ok_confirm or new_password != confirm_password:
-                QMessageBox.warning(self, "Mismatch", "New security codes do not match.")
-                continue
-            break
-
-        if security_manager.change_password(old_password, new_password):
-            QMessageBox.information(self, "Success", "Security code changed successfully!")
-            # Update displayed hash
-            self.hash_value.setText(security_manager.get_stored_hash_b64())
-        else:
-            QMessageBox.critical(self, "Error", "Failed to change security code. Please check logs.")
-
-
-class UploadDialog(QDialog):
-    def __init__(self, parent=None, is_folder=False):
-        super().__init__(parent)
-        self.setWindowTitle("Upload to Peer")
-        self.is_folder = is_folder
-        
-        layout = QVBoxLayout()
-        
-        # Destination path input
-        path_layout = QHBoxLayout()
-        self.path_label = QLabel("Destination Path:")
-        self.path_edit = QLineEdit()
-        self.path_edit.setText(str(Path.home()))  # Default to home directory
-        self.browse_button = QPushButton("Browse...")
-        self.browse_button.clicked.connect(self.browse_destination)
-        
-        path_layout.addWidget(self.path_label)
-        path_layout.addWidget(self.path_edit)
-        path_layout.addWidget(self.browse_button)
-        
-        # Buttons
-        button_layout = QHBoxLayout()
-        self.upload_button = QPushButton("Upload")
-        self.upload_button.clicked.connect(self.accept)
-        self.cancel_button = QPushButton("Cancel")
-        self.cancel_button.clicked.connect(self.reject)
-        
-        button_layout.addWidget(self.upload_button)
-        button_layout.addWidget(self.cancel_button)
-        
-        layout.addLayout(path_layout)
-        layout.addLayout(button_layout)
-        self.setLayout(layout)
-    
-    def browse_destination(self):
-        path = QFileDialog.getExistingDirectory(
-            self, "Select Destination Directory", self.path_edit.text()
-        )
-        if path:
-            self.path_edit.setText(path)
-    
-    def get_destination_path(self):
-        return self.path_edit.text()
-
-class ProgressFileReader:
-    def __init__(self, file_obj, total_size, progress_callback, start_progress=0):
-        self.file_obj = file_obj
-        self.total_size = total_size
-        self.progress_callback = progress_callback
-        self.bytes_read = 0
-        self.start_progress = start_progress
-        self._last_progress_update = 0
-        self._progress_update_interval = 0.1  # Update every 100ms
-        self._chunk_size = 1024 * 1024  # Use 1MB chunks for better performance
-        self._buffer = b''  # Buffer for partial chunks
-        self._is_closed = False
-        self._eof = False  # Track EOF state
-
-    def read(self, size=None):
-        """Read data from the file with improved streaming reliability"""
-        if self._is_closed:
-            return b''
-
-        if self._is_cancelled():
-            logger.info("Read operation cancelled")
-            self._is_closed = True
-            return b''
-
-        try:
-            # If we have buffered data and it's enough for the requested size
-            if self._buffer:
-                if size is None:
-                    # Return all buffered data if no size specified
-                    data = self._buffer
-                    self._buffer = b''
-                    self._update_progress(len(data))
-                    return data
-                elif len(self._buffer) >= size:
-                    # Return requested amount from buffer
-                    data = self._buffer[:size]
-                    self._buffer = self._buffer[size:]
-                    self._update_progress(len(data))
-                    return data
-
-            # If we've reached EOF and have no buffer, return empty
-            if self._eof and not self._buffer:
-                return b''
-
-            # Read new data from file
-            chunk = self.file_obj.read(self._chunk_size)
-            if not chunk:  # EOF
-                self._eof = True
-                if not self._buffer:  # No more data to return
-                    self._is_closed = True
-                    return b''
-                # Return remaining buffer
-                data = self._buffer
-                self._buffer = b''
-                self._update_progress(len(data))
-                return data
-
-            # If we have a size request
-            if size is not None:
-                if len(chunk) > size:
-                    # Split chunk and buffer the rest
-                    data = chunk[:size]
-                    self._buffer = chunk[size:] + self._buffer
-                else:
-                    # Use entire chunk
-                    data = chunk
-            else:
-                # No size specified, use entire chunk
-                data = chunk
-
-            self._update_progress(len(data))
-            return data
-
-        except Exception as e:
-            logger.error(f"Error reading file: {str(e)}")
-            self._is_closed = True
-            raise
-
-    def _update_progress(self, bytes_read):
-        """Update progress with throttling"""
-        self.bytes_read += bytes_read
-        current_time = time.time()
-        
-        if (current_time - self._last_progress_update >= self._progress_update_interval or 
-            self.bytes_read == self.total_size):
-            progress = self.start_progress + int((self.bytes_read / self.total_size) * (100 - self.start_progress))
-            self.progress_callback(progress, f"Uploading: {progress}%")
-            self._last_progress_update = current_time
-
-    def __len__(self):
-        return self.total_size
-
-    def close(self):
-        """Close the file reader"""
-        if not self._is_closed:
-            self._is_closed = True
-            try:
-                self.file_obj.close()
-            except:
-                pass
-
-    def __del__(self):
-        """Ensure file is closed on deletion"""
-        self.close()
-
-    def _is_cancelled(self):
-        if hasattr(self, 'worker_instance') and hasattr(self.worker_instance, '_is_cancelled'):
-            return self.worker_instance._is_cancelled
-        return False
-
-class UploadWorker(QThread):
-    """Worker thread for file/folder uploads, encrypting files before sending."""
-    progress = pyqtSignal(int, str)  # progress percentage, status message
-    finished = pyqtSignal(bool, str)  # success, message
-    
-    def __init__(self, ip, port, token, source_path, dest_path, is_folder):
-        super().__init__()
-        self.ip = ip
-        self.port = port
-        self.token = token
-        self.source_path = str(Path(source_path).resolve())
-        self.dest_path = str(Path(dest_path).resolve())
-        self.is_folder = is_folder
-        self._is_cancelled = False
-        self._session = requests.Session()
-        self._session.verify = False
-        self._session.headers.update({"Authorization": f"Bearer {token}"})
-        
-    def run(self):
-        try:
-            # Ensure encryption key is available
-            if security_manager.get_encryption_key() is None:
-                raise ValueError("Encryption key is not loaded. Cannot upload securely.")
-
-            logger.info(f"Starting upload worker for {'folder' if self.is_folder else 'file'}: {self.source_path}")
-            if self.is_folder:
-                self.upload_folder()
-            else:
-                self.upload_file()
-        except ValueError as ve:
-            logger.error(f"Upload error: {ve}", exc_info=True)
-            self.finished.emit(False, f"Upload failed: {ve}. (Security key missing?)")
-        except Exception as e:
-            if not self._is_cancelled:
-                logger.error(f"Upload error: {str(e)}", exc_info=True)
-                self.finished.emit(False, f"Upload failed: {str(e)}")
-        finally:
-            self._session.close()
-    
-    def cancel(self):
-        """Cancel the upload operation"""
-        logger.info("Upload cancellation requested")
-        self._is_cancelled = True
-        self._session.close()
-    
-    def _progress_reader(self, file_obj, total_size, start_progress=0):
-        """Wraps a file object to provide progress updates during read operations."""
-        reader = ProgressFileReader(file_obj, total_size, self.progress.emit, start_progress)
-        reader.worker_instance = self
-        return reader
-    
-    def upload_file(self):
-        """Encrypts and uploads a single file."""
-        if self._is_cancelled:
-            return
-            
-        temp_encrypted_path = None
-        try:
-            filename = Path(self.source_path).name
-            
-            logger.info(f"Preparing file for upload (encrypting): {filename}")
-            self.progress.emit(0, f"Encrypting {filename}...") # Changed from print_json_message for QThread
-
-            # Read original content
-            with open(self.source_path, 'rb') as f_read:
-                original_data = f_read.read()
-
-            # Encrypt data
-            encrypted_data = security_manager.encrypt_data(original_data)
-            encrypted_size = len(encrypted_data)
-            
-            # Write encrypted data to a temporary file for streaming
-            with tempfile.NamedTemporaryFile(delete=False, dir=CONFIG_DIR) as temp_enc_file:
-                temp_encrypted_path = Path(temp_enc_file.name)
-                temp_enc_file.write(encrypted_data)
-            
-            logger.debug(f"Encrypted file written to temp: {temp_encrypted_path}, size: {encrypted_size} bytes")
-            self.progress.emit(10, f"Encrypted {filename}...") # Update progress after encryption
-            
-            with open(temp_encrypted_path, "rb") as f_encrypted:
-                progress_file_reader = self._progress_reader(f_encrypted, encrypted_size, start_progress=10) # Start progress from 10%
-                files = {
-                    "file": (filename, progress_file_reader, "application/octet-stream")
-                }
-                data = {
-                    "dest_path": self.dest_path
-                }
-                
-                try:
-                    self.progress.emit(10, "Starting upload...")
-                    r = self._session.put(
-                        f"https://{self.ip}:{self.port}/upload/{filename}",
-                        files=files,
-                        data=data,
-                        timeout=30
-                    )
-                    
-                    if self._is_cancelled:
-                        logger.info("Upload cancelled after request")
-                        return
-                        
-                    if r.ok:
-                        response = r.json()
-                        logger.info(f"Encrypted file uploaded successfully to {response['path']}")
-                        self.progress.emit(100, "Upload complete")
-                        self.finished.emit(True, f"File uploaded successfully to {response['path']}")
-                    else:
-                        error_msg = f"Upload failed: {r.status_code}"
-                        if r.text:
-                            try:
-                                error_detail = r.json().get("detail", r.text)
-                                error_msg += f" - {error_detail}"
-                            except:
-                                error_msg += f" - {r.text}"
-                        logger.error(error_msg)
-                        self.finished.emit(False, error_msg)
-                except requests.exceptions.Timeout:
-                    if not self._is_cancelled:
-                        logger.error("Upload timed out")
-                        self.finished.emit(False, "Upload timed out")
-                except requests.exceptions.ConnectionError as e:
-                    if not self._is_cancelled:
-                        logger.error(f"Connection error: {str(e)}")
-                        self.finished.emit(False, "Connection lost during upload")
-                except Exception as e:
-                    if not self._is_cancelled:
-                        logger.error(f"Upload error: {str(e)}", exc_info=True)
-                        self.finished.emit(False, f"Upload error: {str(e)}")
-        except ValueError as ve:
-            logger.error(f"Encryption error for {filename}: {ve}", exc_info=True)
-            self.finished.emit(False, f"Upload failed: Encryption error ({ve}).")
-        except Exception as e:
-            if not self._is_cancelled:
-                logger.error(f"Error preparing upload: {str(e)}", exc_info=True)
-                self.finished.emit(False, f"Error preparing upload: {str(e)}")
-        finally:
-            if temp_encrypted_path and temp_encrypted_path.exists():
-                os.unlink(temp_encrypted_path)
-                logger.debug(f"Cleaned up temporary encrypted file: {temp_encrypted_path}")
-    
-    def _validate_zip_file(self, zip_path):
-        """Validate zip file integrity before upload"""
-        try:
-            with zipfile.ZipFile(zip_path, 'r') as zipf:
-                # Test zip file integrity
-                if zipf.testzip() is not None:
-                    raise ValueError("Zip file integrity check failed")
-                
-                # Check if zip file is not empty
-                if not zipf.namelist():
-                    raise ValueError("Zip file is empty")
-                
-                # Check for maximum file size (e.g., 2GB)
-                total_size = sum(info.file_size for info in zipf.filelist)
-                if total_size > 2 * 1024 * 1024 * 1024:  # 2GB
-                    raise ValueError("Zip file exceeds maximum size limit of 2GB")
-                
-                # Validate file paths and names
-                for name in zipf.namelist():
-                    # Check for absolute paths
-                    if name.startswith('/') or '\\' in name:
-                        raise ValueError(f"Invalid path in zip: {name} (contains absolute path)")
-                    
-                    # Check for parent directory references
-                    if '..' in name.split('/'):
-                        raise ValueError(f"Invalid path in zip: {name} (contains parent directory reference)")
-                    
-                    # Check for invalid characters in filenames
-                    invalid_chars = '<>:"|?*'
-                    if any(char in name for char in invalid_chars):
-                        raise ValueError(f"Invalid characters in filename: {name}")
-                    
-                    # Check for maximum path length (Windows limit)
-                    if len(name) > 260:
-                        raise ValueError(f"Path too long: {name}")
-                
-                return True
-        except zipfile.BadZipFile:
-            raise ValueError("Invalid zip file format")
-        except Exception as e:
-            raise ValueError(f"Zip file validation failed: {str(e)}")
-
-    def _sanitize_filename(self, filename):
-        """Sanitize filename to be safe for zip files"""
-        # Replace invalid characters with underscore
-        invalid_chars = '<>:"|?*'
-        for char in invalid_chars:
-            filename = filename.replace(char, '_')
-        
-        # Remove leading/trailing spaces and dots
-        filename = filename.strip('. ')
-        
-        # Ensure filename is not empty after sanitization
-        if not filename:
-            filename = 'unnamed_file'
-            
-        return filename
-
-    def _get_relative_path(self, file_path, source_path):
-        """Get a safe relative path for the zip file"""
-        try:
-            rel_path = os.path.relpath(file_path, source_path)
-            # Convert to forward slashes for zip files
-            rel_path = rel_path.replace('\\', '/')
-            
-            # Ensure path is relative and doesn't contain '..'
-            if rel_path.startswith('..') or os.path.isabs(rel_path):
-                raise ValueError(f"Invalid path in zip: {rel_path}")
-                
-            return rel_path
-        except Exception as e:
-            raise ValueError(f"Error creating relative path: {str(e)}")
-
-    def _create_zip_file(self, source_path, temp_dir):
-        """Create zip file with improved error handling and progress tracking, encrypting files."""
-        zip_path = os.path.join(temp_dir, f"{Path(source_path).name}.zip")
-        logger.debug(f"Creating zip file at: {zip_path}")
-        
-        try:
-            total_size = 0
-            file_count = 0
-            files_to_zip = []
-            
-            for root, _, files in os.walk(source_path):
-                for file_name in files: # Renamed 'file' to 'file_name' to avoid conflict with built-in
-                    try:
-                        file_path = os.path.join(root, file_name)
-                        if not os.path.exists(file_path):
-                            continue
-                            
-                        if not os.access(file_path, os.R_OK):
-                            logger.warning(f"No read permission for file: {file_path}")
-                            continue
-                            
-                        # Path within the zip, relative to the original folder's parent
-                        arcname = str(Path(file_path).relative_to(Path(source_path).parent)).replace("\\", "/") 
-
-                        # Note: original_file_size is used for progress calculation based on unencrypted data
-                        original_file_size = os.path.getsize(file_path)
-                        total_size += original_file_size 
-                        file_count += 1
-                        files_to_zip.append((file_path, arcname, original_file_size))
-                        
-                    except (OSError, PermissionError) as e:
-                        logger.warning(f"Error accessing file {file_name}: {str(e)}")
-                        continue
-            
-            if file_count == 0:
-                raise ValueError("No valid files found to zip")
-            
-            # Create zip file with progress tracking
-            processed_original_size = 0
-            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, allowZip64=True) as zipf:
-                for file_path, arcname, original_file_size in files_to_zip:
-                    if self._is_cancelled:
-                        raise InterruptedError("Upload cancelled during zip creation")
-                        
-                    try:
-                        # Read original file content
-                        with open(file_path, 'rb') as f_read:
-                            original_data = f_read.read()
-
-                        # Encrypt data
-                        encrypted_data = security_manager.encrypt_data(original_data)
-                        
-                        # Add encrypted data to the zip
-                        zipf.writestr(arcname, encrypted_data) # arcname is the path within the zip
-                        
-                        # Update progress based on original size for user clarity
-                        processed_original_size += original_file_size
-                        progress = int((processed_original_size / total_size) * 50)  # First 50% for zipping
-                        self.progress.emit(progress, f"Preparing folder (encrypting): {progress}%")
-                        
-                    except Exception as e:
-                        logger.error(f"Error encrypting or adding file {file_path} to zip: {str(e)}", exc_info=True)
-                        raise # Re-raise to ensure error is handled
-            
-            # Validate zip file before returning (validation now applies to zip of encrypted files)
-            self._validate_zip_file(zip_path) 
-            return zip_path
-            
-        except Exception as e:
-            # Clean up zip file if it exists
-            if os.path.exists(zip_path):
-                try:
-                    os.remove(zip_path)
-                except:
-                    pass
-            raise e
-
-    def upload_folder(self):
-        """Upload a folder with improved error handling and retry logic"""
-        if self._is_cancelled:
-            return
-            
-        try:
-            folder_name = Path(self.source_path).name
-            logger.info(f"Starting folder upload: {folder_name}")
-            
-            # Create temporary directory for zip file
-            with tempfile.TemporaryDirectory(dir=CONFIG_DIR) as temp_dir: # Use CONFIG_DIR for temp
-                try:
-                    # Create and validate zip file (now includes encryption)
-                    zip_path = self._create_zip_file(self.source_path, temp_dir)
-                    
-                    # Upload zip file with improved retry logic
-                    max_retries = 3
-                    retry_count = 0
-                    last_error = None
-                    base_wait_time = 2
-                    
-                    while retry_count < max_retries and not self._is_cancelled:
-                        try:
-                            file_size = os.path.getsize(zip_path) # This is the size of the *encrypted* zip
-                            logger.info(f"Uploading zip file: {file_size} bytes")
-                            
-                            # Validate zip file before each attempt
-                            self._validate_zip_file(zip_path)
-                            
-                            session = requests.Session()
-                            session.verify = False
-                            
-                            # Encode headers properly for Unicode characters
-                            headers = {
-                                "Authorization": f"Bearer {self.token}",
-                                "Content-Type": "application/octet-stream",
-                                "X-Folder-Name": base64.b64encode(folder_name.encode('utf-8')).decode('ascii'),
-                                "X-Dest-Path": base64.b64encode(self.dest_path.encode('utf-8')).decode('ascii')
-                            }
-                            session.headers.update(headers)
-                            
-                            # Configure retry strategy for the upload
-                            retry_strategy = requests.adapters.Retry(
-                                total=2,
-                                backoff_factor=0.5,
-                                status_forcelist=[500, 502, 503, 504]
-                            )
-                            adapter = requests.adapters.HTTPAdapter(max_retries=retry_strategy)
-                            session.mount("https://", adapter)
-                            
-                            try:
-                                # Open file in binary mode for streaming
-                                with open(zip_path, 'rb') as f:
-                                    # Create a streaming upload with progress tracking
-                                    # Progress starts from 50% because zipping/encryption took first 50%
-                                    progress_file_reader = self._progress_reader(f, file_size, 50) 
-                                    
-                                    self.progress.emit(50, "Starting folder upload...")
-                                    
-                                    # Use streaming upload with increased timeout
-                                    r = session.post(
-                                        f"https://{self.ip}:{self.port}/upload-folder",
-                                        data=progress_file_reader,
-                                        timeout=(30, 300),  # (connect timeout, read timeout)
-                                        stream=True  # Enable streaming mode
-                                    )
-                                    
-                                    if self._is_cancelled:
-                                        logger.info("Upload cancelled during transfer")
-                                        raise InterruptedError("Upload cancelled during transfer")
-                                        
-                                    if r.ok:
-                                        response = r.json()
-                                        logger.info(f"Folder uploaded successfully to {response['path']}")
-                                        self.progress.emit(100, "Upload complete")
-                                        self.finished.emit(True, f"Folder uploaded successfully to {response['path']}")
-                                        return
-                                    else:
-                                        error_msg = f"Upload failed: {r.status_code}"
-                                        if r.text:
-                                            try:
-                                                error_detail = r.json().get("detail", r.text)
-                                                error_msg += f" - {error_detail}"
-                                            except:
-                                                error_msg += f" - {r.text}"
-                                                
-                                        raise requests.exceptions.HTTPError(error_msg)
-                                    
-                            except requests.exceptions.RequestException as e:
-                                if self._is_cancelled:
-                                    raise InterruptedError("Upload cancelled during transfer")
-                                raise
-                                
-                        except (ValueError, PermissionError, ConnectionError, InterruptedError) as e: # Added InterruptedError
-                            # These errors should not be retried, or are user-initiated cancel
-                            raise
-                        except Exception as e:
-                            retry_count += 1
-                            last_error = str(e)
-                            if retry_count < max_retries:
-                                wait_time = base_wait_time * (2 ** (retry_count - 1))
-                                logger.warning(f"Upload attempt {retry_count} failed: {str(e)}. Retrying in {wait_time} seconds...")
-                                time.sleep(wait_time)
-                            else:
-                                raise
-                                
-                    if retry_count >= max_retries:
-                        raise Exception(f"Upload failed after {max_retries} attempts. Last error: {last_error}")
-                        
-                finally:
-                    # Clean up zip file
-                    if os.path.exists(zip_path):
-                        try:
-                            os.remove(zip_path)
-                        except:
-                            pass
-                            
-        except InterruptedError:
-            logger.info("Folder upload cancelled")
-            self.finished.emit(False, "Upload cancelled by user")
-        except ValueError as e:
-            logger.error(f"Validation or Encryption error during folder upload: {str(e)}")
-            self.finished.emit(False, f"Upload failed: {str(e)}")
-        except PermissionError as e:
-            logger.error(f"Permission error during folder upload: {str(e)}")
-            self.finished.emit(False, f"Upload failed: {str(e)}")
-        except TimeoutError as e:
-            logger.error(f"Timeout during folder upload: {str(e)}")
-            self.finished.emit(False, f"Upload failed: {str(e)}")
-        except ConnectionError as e:
-            logger.error(f"Connection error during folder upload: {str(e)}")
-            self.finished.emit(False, f"Upload failed: {str(e)}")
-        except Exception as e:
-            if not self._is_cancelled:
-                logger.error(f"Error preparing folder upload: {str(e)}", exc_info=True)
-                self.finished.emit(False, f"Error preparing folder upload: {str(e)}")
-
-class DownloadProcess(QObject):
-    """Process for handling downloads"""
-    progress = pyqtSignal(int, str)  # progress percentage, status message
-    finished = pyqtSignal(bool, str)  # success, message
-    cleanup = pyqtSignal()  # signal to clean up resources
-    
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.process = QProcess()
-        self.process.readyReadStandardOutput.connect(self._handle_output)
-        self.process.finished.connect(self._handle_finished)
-        self.process.errorOccurred.connect(self._handle_process_error)
-        self.is_running = False
-        self._last_progress_update = 0
-        self._progress_update_interval = 0.1  # Update every 100ms
-        
-    def start_download(self, ip, port, token, items, download_dir, is_folder):
-        """Start the download process with improved error handling, passing encryption key."""
-        try:
-            if self.is_running:
-                logger.warning("Download process already running")
-                return
-            
-            # Get the encryption key from the main process's security_manager
-            encryption_key_bytes = security_manager.get_encryption_key()
-            if encryption_key_bytes is None:
-                raise ValueError("Encryption key is not loaded. Cannot download securely.")
-            
-            # Base64 encode the encryption key to pass it as a command-line argument
-            encryption_key_b64 = base64.b64encode(encryption_key_bytes).decode('utf-8')
-
-            # Convert items to base64 encoded JSON
-            items_json = json.dumps(items, ensure_ascii=False)
-            items_b64 = base64.b64encode(items_json.encode('utf-8')).decode('utf-8')
-            
-            # Build command
-            script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'download_script.py')
-            cmd = [
-                sys.executable,
-                script_path,
-                ip,
-                str(port),
-                token,
-                items_b64,
-                download_dir,
-                str(is_folder).lower(),
-                encryption_key_b64 # NEW: Pass the encryption key here
-            ]
-            
-            logger.info(f"Starting download process with command (partial): {cmd[0]} {cmd[1]} ... (key omitted from log)")
-            
-            # Start process
-            self.process.start(cmd[0], cmd[1:])
-            if not self.process.waitForStarted(5000):  # Wait up to 5 seconds
-                raise RuntimeError("Failed to start download process")
-                
-            self.is_running = True
-            
-        except ValueError as ve:
-            error_msg = f"Failed to start download: {ve}. (Security key missing?)"
-            logger.error(error_msg)
-            self.finished.emit(False, error_msg)
-            self.cleanup.emit()
-        except Exception as e:
-            error_msg = f"Failed to start download: {str(e)}"
-            logger.error(error_msg)
-            self.finished.emit(False, error_msg)
-            self.cleanup.emit()
-
-    def stop(self):
-        """Stop the download process"""
-        logger.info("Stopping download process...")
-        if self.process.state() == QProcess.Running:
-            try:
-                self.process.kill() # Terminate the process
-                if not self.process.waitForFinished(3000): # Wait up to 3 seconds
-                    logger.warning("Download process did not finish in time after kill.")
-            except Exception as e:
-                logger.error(f"Error stopping download process: {str(e)}")
-        self.is_running = False
-        self.cleanup.emit() # Ensure cleanup signal is emitted
-
-    def _handle_output(self):
-        """Handle process output with throttled progress updates"""
-        try:
-            output = self.process.readAllStandardOutput().data().decode('utf-8')
-            current_time = time.time()
-            
-            for line in output.splitlines():
-                try:
-                    data = json.loads(line)
-                    if 'progress' in data:
-                        # Throttle progress updates
-                        if current_time - self._last_progress_update >= self._progress_update_interval:
-                            self.progress.emit(data['progress'], data.get('status', ''))
-                            self._last_progress_update = current_time
-                    elif 'error' in data:
-                        logger.error(f"Download error: {data['error']}")
-                        self.finished.emit(False, data['error'])
-                        self.stop()
-                except json.JSONDecodeError:
-                    logger.warning(f"Invalid JSON output: {line}")
-                except Exception as e:
-                    logger.error(f"Error processing output: {str(e)}")
-        except Exception as e:
-            logger.error(f"Error reading process output: {str(e)}")
-
-    def _handle_finished(self, exit_code, exit_status):
-        """Handle process completion with proper cleanup"""
-        try:
-            self.is_running = False
-            if exit_code == 0:
-                self.finished.emit(True, "Download completed successfully")
-            else:
-                error_msg = f"Download failed with exit code {exit_code}"
-                logger.error(error_msg)
-                self.finished.emit(False, error_msg)
-        except Exception as e:
-            logger.error(f"Error handling process completion: {str(e)}")
-        finally:
-            self.cleanup.emit()
-
-    def _handle_process_error(self, error):
-        """Handle process errors with proper cleanup"""
-        try:
-            error_msg = f"Process error: {error}"
-            logger.error(error_msg)
-            self.finished.emit(False, error_msg)
-        except Exception as e:
-            logger.error(f"Error handling process error: {str(e)}")
-        finally:
-            self.cleanup.emit()
-
-class TokenFetcher(QThread):
-    """
-    Worker thread for fetching/refreshing tokens and checking peer online status
-    without blocking the main GUI thread.
-    """
-    token_fetched = pyqtSignal(str, str) # peer_text, token or None if failed
-    peer_status_updated = pyqtSignal(str, bool) # peer_text, is_online
-
-    def __init__(self, peer_text: str, ip: str, port: int, parent=None):
-        super().__init__(parent)
-        self.peer_text = peer_text
-        self.ip = ip
-        self.port = port
-        self.session = requests.Session()
-        self.session.verify = False # Disable SSL verification for local network
-        
-        # Add retry strategy for all requests in this session
-        retry_strategy = requests.adapters.Retry(
-            total=2,
-            backoff_factor=0.5,
-            status_forcelist=[500, 502, 503, 504]
-        )
-        adapter = requests.adapters.HTTPAdapter(max_retries=retry_strategy)
-        self.session.mount("https://", adapter)
-
-    def run(self):
-        try:
-            # First, check online status
-            is_online = self._check_online()
-            self.peer_status_updated.emit(self.peer_text, is_online)
-
-            if is_online:
-                # If online, try to fetch token
-                token = self._fetch_token()
-                self.token_fetched.emit(self.peer_text, token)
-            else:
-                self.token_fetched.emit(self.peer_text, None) # No token if offline
-        except Exception as e:
-            logger.error(f"Error in TokenFetcher for {self.peer_text}: {str(e)}", exc_info=True)
-            self.peer_status_updated.emit(self.peer_text, False)
-            self.token_fetched.emit(self.peer_text, None)
-        finally:
-            self.session.close()
-
-    def _check_online(self) -> bool:
-        """Internal method to check if a peer is online."""
-        try:
-            r = self.session.get(f"https://{self.ip}:{self.port}/ping", timeout=(3, 5))
-            if r.ok:
-                try:
-                    data = r.json()
-                    return data.get("status") == "online"
-                except ValueError:
-                    logger.debug(f"Peer {self.ip}:{self.port} returned invalid JSON for ping.")
-                    return False
-            logger.debug(f"Peer {self.ip}:{self.port} ping returned status {r.status_code}.")
-            return False
-        except requests.exceptions.SSLError:
-            logger.debug(f"SSL error pinging peer {self.ip}:{self.port}. Assuming online for self-signed certs.")
-            return True # Assume online for self-signed certs even with SSL warnings
-        except requests.exceptions.RequestException as e:
-            logger.debug(f"Request error pinging peer {self.ip}:{self.port}: {str(e)}")
-            return False
-        except Exception as e:
-            logger.error(f"Unexpected error in _check_online for {self.ip}:{self.port}: {str(e)}")
-            return False
-
-    def _fetch_token(self) -> str | None:
-        """Internal method to fetch a token from the peer."""
-        try:
-            r = self.session.post(
-                f"https://{self.ip}:{self.port}/auth",
-                json={"device_id": settings.device_id},
-                timeout=(3, 5)
-            )
-            r.raise_for_status()
-            token = r.json()["token"]
-            logger.debug(f"Successfully obtained token for {self.peer_text}")
-            return token
-        except requests.exceptions.RequestException as e:
-            logger.warning(f"Error fetching token from {self.peer_text}: {str(e)}")
-            return None
-        except Exception as e:
-            logger.error(f"Unexpected error in _fetch_token for {self.peer_text}: {str(e)}", exc_info=True)
-            return None
+# Global Security Manager instance (from main.py, assuming it's passed or set up)
+# self.security_manager = SecurityManager(CONFIG_DIR) # Re-initialize or ensure it's a global singleton in main.py
 
 
 class MainWindow(QWidget):
-    def __init__(self):
+    """
+    The main application window for the P2PShare system.
+    Manages peer discovery, file browsing, and file transfer operations.
+    Now allows browsing of the entire filesystem for authorized peers.
+    """
+    def __init__(self, security_manager: SecurityManager):
         super().__init__()
         logger.info("Initializing main window (MainWindow.__init__ start)")
         try:
-            self.setWindowTitle("P2PShare")
+            self.setWindowTitle(settings.device_id)
             self.setGeometry(100, 100, 1200, 800)
 
-            # Initialize state with improved defaults
-            self.discovery = PeerDiscovery(port=settings.http_port)
-            self.peer_tokens = {}
-            self.last_peer_check = {}
-            self.peer_check_timeout = 60  # Increased timeout to reduce auth requests 
-            self._operation_lock = threading.RLock()  # Use RLock instead of Lock for better deadlock prevention
-            self.current_download = None
-            self.current_worker = None
-            self.current_progress = None
-            self.is_operation_cancelled = False
-            self.offline_peers = set()  # Track offline peers
-            self.last_peer_update = datetime.now()
-            self.peer_update_interval = 5  # Update peers every 5 seconds for better responsiveness
-            self._discovery_running = True  # Flag to control discovery thread
-            self._cleanup_in_progress = False  # Flag to track cleanup state
-            self.active_token_fetchers = {} # New: Dictionary to hold active TokenFetcher threads
+            # Initialize core components
+            self.discovery = PeerDiscovery(port=settings.http_port, device_id=settings.device_id)
+
+            # security manager
+            self.security_manager = security_manager
             
-            # Add new peer connection tracking
-            self.peer_connection_attempts = {}  # Track connection attempts per peer
-            self.peer_last_success = {}  # Track last successful connection
-            self.peer_retry_delay = 30  # Seconds to wait before retrying failed peers
-            self.max_connection_attempts = 3  # Maximum number of connection attempts
-            self.peer_health_check_timer = QTimer()
+            # State management for peers and operations
+            self.peer_tokens = {} # Stores tokens for peers: {ip:port_str: token}
+            self.last_peer_check = {} # Stores last check time for peers: {ip:port_str: datetime_obj}
+            self.peer_check_timeout = 60 # Seconds to consider token valid before re-fetching
+            self.offline_peers = set() # Stores peer_text of offline peers
+            self.last_peer_update = datetime.now() # Last time peer list was updated from discovery
+            self.peer_update_interval = 5 # Seconds between peer list updates from discovery
+            
+            self._operation_lock = threading.RLock() # Reentrant Lock for multi-threaded state access
+            self.current_download = None # Reference to active DownloadProcess
+            self.current_worker = None # Reference to active UploadWorker
+            self.current_progress = None # Reference to active QProgressDialog
+            self.is_operation_cancelled = False # Flag for user-initiated cancellation
+            self.active_token_fetchers = {} # Tracks active TokenFetcher threads to prevent duplicates
+            
+            # Peer connection health tracking
+            self.peer_connection_attempts = {} # {peer_text: count}
+            self.peer_last_success = {} # {peer_text: datetime}
+            self.peer_retry_delay = 30 # Seconds to wait before retrying failed peer token fetch
+            self.max_connection_attempts = 5 # Maximum number of immediate token fetch attempts
+            
+            # Setup timers
+            self.peer_health_check_timer = QTimer(self)
             self.peer_health_check_timer.timeout.connect(self._check_peer_health)
-            # self.peer_health_check_timer.start(10000) # DEFERRED START
             logger.info("MainWindow: Peer health check timer created (will start deferred).")
 
-            # Start discovery thread with error handling
-            try:
-                self.discovery_thread = threading.Thread(target=self._run_discovery, daemon=True)
-                self.discovery_thread.start()
-                logger.info("Started peer discovery thread")
-            except Exception as e:
-                logger.error(f"Failed to start discovery thread: {str(e)}", exc_info=True)
-                QMessageBox.critical(self, "Error", "Failed to start peer discovery. The application may not function correctly.")
-
-            # Create UI update timer with reduced frequency
-            self._ui_update_timer = QTimer()
+            self._ui_update_timer = QTimer(self)
             self._ui_update_timer.timeout.connect(self._process_ui_updates)
-            self._ui_update_timer.start(250)
+            self._ui_update_timer.start(250) # Update UI at 4 FPS for responsiveness
             logger.info("MainWindow: _ui_update_timer started.")
             
-            # Create cleanup timer
-            self._cleanup_timer = QTimer()
-            self._cleanup_timer.setSingleShot(True)
-            self._cleanup_timer.timeout.connect(self._delayed_cleanup)
+            self._cleanup_timer = QTimer(self)
+            self._cleanup_timer.setSingleShot(True) # Runs once
+            # self._cleanup_timer.timeout.connect(self._delayed_cleanup)
             logger.info("MainWindow: _cleanup_timer created.")
+
+            self._cleanup_in_progress = False # Reset flag
             
-            # Initialize UI with improved layout
+            self.timer = QTimer(self) # Timer for updating the peer list from discovery
+            self.timer.timeout.connect(self.update_peer_list)
+            logger.info("MainWindow: Peer list update timer created (will start deferred).")
+            
+            # Initial UI setup
             logger.info("MainWindow: Calling _init_ui()...")
             self._init_ui()
             logger.info("MainWindow: _init_ui() completed.")
             
-            # Start peer list update timer with increased frequency
-            self.timer = QTimer()
-            self.timer.timeout.connect(self.update_peer_list)
-            # self.timer.start(self.peer_update_interval * 1000) # DEFERRED START
-            logger.info("MainWindow: Peer list update timer created (will start deferred).")
-            
-            # Initialize state
+            # Start discovery thread
+            self._discovery_running = True # Flag to control discovery thread's loop
+            self.discovery_thread = threading.Thread(target=self._run_discovery, daemon=True)
+            self.discovery_thread.start()
+            logger.info("Started peer discovery thread.")
+
+            # Initial state for file browser - now starts at system root '/'
             self.current_peer = None
-            self.current_path = "/"
+            self.current_path = "/" # Start at system root or drive list
             self.path_history = []
-            logger.info("MainWindow: Deferred starting initial update_peer_list() and timers...")
-            # Defer initial update and timer starts to ensure __init__ fully completes
-            QTimer.singleShot(100, self._start_initial_tasks) # Start after a short delay
+
+            # Defer initial tasks to ensure main window is fully initialized and shown
+            QTimer.singleShot(100, self._start_initial_tasks)
             
             logger.info("Initializing main window (MainWindow.__init__ end)")
         except Exception as e:
             logger.critical(f"Error during MainWindow initialization: {str(e)}", exc_info=True)
             QMessageBox.critical(self, "Initialization Error", f"An error occurred during window setup: {str(e)}")
-            raise # Re-raise the exception to propagate it to main()
+            raise # Re-raise to propagate to main()
 
     def _start_initial_tasks(self):
-        """Method to start tasks that rely on full MainWindow initialization."""
+        """Method to start tasks that rely on full MainWindow initialization and showing."""
         logger.info("MainWindow: Starting deferred initial tasks...")
-        self.update_peer_list()  # Initial update
+        self.update_peer_list() # Perform initial peer list update
         logger.info("MainWindow: Initial update_peer_list() completed.")
         self.timer.start(self.peer_update_interval * 1000) # Start periodic peer list updates
         logger.info("MainWindow: Periodic peer list update timer started.")
-        self.peer_health_check_timer.start(10000) # Start periodic health checks
+        self.peer_health_check_timer.start(10000) # Start periodic health checks (every 10 seconds)
         logger.info("MainWindow: Periodic peer health check timer started.")
 
     def _run_discovery(self):
-        """Run discovery with error handling and proper shutdown"""
+        """
+        Runs the PeerDiscovery service in a separate thread.
+        This method blocks until unregister is called on the discovery instance.
+        """
         try:
-            # Start the discovery service
             logger.info("Discovery thread: Starting discovery.run()...")
-            self.discovery.run()  # Use run() method
+            self.discovery.run()
             logger.info("Discovery thread: discovery.run() exited.")
         except Exception as e:
             logger.error(f"Discovery thread error: {str(e)}", exc_info=True)
-            if self._discovery_running:  # Only show message if we're still supposed to be running
+            if self._discovery_running: # Only show message if still expected to be running
                 QTimer.singleShot(0, lambda: QMessageBox.warning(
                     self, "Discovery Error",
                     "Peer discovery service encountered an error. Some features may be limited."
                 ))
         finally:
-            logger.info("Discovery thread exiting")
-            self._discovery_running = False  # Ensure flag is set to False
+            logger.info("Discovery thread exiting.")
+            self._discovery_running = False # Ensure flag is set to False upon exit
 
     def _init_ui(self):
-        """Initialize the user interface with improved layout and styling"""
+        """Initializes the user interface elements and their layout."""
         logger.info("MainWindow._init_ui() start.")
         try:
-            # Create main layout with better spacing
-            self.layout = QVBoxLayout()
+            # Main layout setup
+            self.layout = QVBoxLayout(self)
             self.layout.setSpacing(10)
             self.layout.setContentsMargins(10, 10, 10, 10)
-            logger.debug("MainWindow._init_ui(): Main layout created.")
             
-            # Create splitter for peers and files with improved sizing
+            # Splitter for left (peers) and right (files) panels
             self.splitter = QSplitter(Qt.Horizontal)
-            logger.debug("MainWindow._init_ui(): QSplitter created.")
             
-            # Left panel for peers with improved styling
+            # Left Panel: Peer List
             self.peers_panel = QWidget()
-            self.peers_layout = QVBoxLayout()
+            self.peers_layout = QVBoxLayout(self.peers_panel)
             self.peers_layout.setSpacing(5)
-            self.peers_panel.setLayout(self.peers_layout)
-            logger.debug("MainWindow._init_ui(): Peers panel created.")
             
-            # Add status label for peer count
             self.peer_status = QLabel("No peers discovered")
-            self.peer_status.setStyleSheet("color: gray;")
+            self.peer_status.setStyleSheet("color: gray; font-weight: bold;")
             self.peers_layout.addWidget(self.peer_status)
-            logger.debug("MainWindow._init_ui(): Peer status label created.")
             
             self.peers_list = QListWidget()
             self.peers_list.setStyleSheet("""
@@ -1069,43 +176,66 @@ class MainWindow(QWidget):
                     border: 1px solid #ccc;
                     border-radius: 4px;
                     padding: 2px;
+                    background-color: #f9f9f9;
                 }
                 QListWidget::item {
                     padding: 4px;
+                    border-bottom: 1px solid #eee; /* Subtle separator */
                 }
                 QListWidget::item:selected {
-                    background-color: #e0e0e0;
+                    background-color: #e0e0e0; /* Light gray selection */
+                    color: black;
                 }
             """)
             self.peers_list.itemClicked.connect(self.on_peer_selected)
             self.peers_layout.addWidget(self.peers_list)
-            logger.debug("MainWindow._init_ui(): Peers list created and styled.")
 
-            # Peer buttons with improved styling
             self.refresh_button = QPushButton("Refresh Peer List")
             self.refresh_button.setStyleSheet("""
                 QPushButton {
-                    padding: 5px;
+                    padding: 6px 12px;
                     background-color: #f0f0f0;
                     border: 1px solid #ccc;
                     border-radius: 4px;
+                    font-weight: 500;
                 }
                 QPushButton:hover {
                     background-color: #e0e0e0;
                 }
+                QPushButton:pressed {
+                    background-color: #d0d0d0;
+                }
             """)
             self.refresh_button.clicked.connect(self.update_peer_list)
             self.peers_layout.addWidget(self.refresh_button)
-            logger.debug("MainWindow._init_ui(): Refresh button created.")
+
+            self.security_settings_button = QPushButton("Security Settings")
+            self.security_settings_button.setStyleSheet("""
+                QPushButton {
+                    padding: 6px 12px;
+                    background-color: #e6e6e6;
+                    border: 1px solid #ccc;
+                    border-radius: 4px;
+                    font-weight: 500;
+                }
+                QPushButton:hover {
+                    background-color: #d6d6d6;
+                }
+                QPushButton:pressed {
+                    background-color: #c6c6c6;
+                }
+            """)
+            self.security_settings_button.clicked.connect(self._show_security_settings_dialog)
+            self.peers_layout.addWidget(self.security_settings_button)
+
+            self.splitter.addWidget(self.peers_panel)
             
-            # Right panel for files with improved layout
+            # Right Panel: File Browser
             self.files_panel = QWidget()
-            self.files_layout = QVBoxLayout()
+            self.files_layout = QVBoxLayout(self.files_panel)
             self.files_layout.setSpacing(10)
-            self.files_panel.setLayout(self.files_layout)
-            logger.debug("MainWindow._init_ui(): Files panel created.")
             
-            # Navigation bar with improved styling
+            # Navigation bar for file browser
             self.nav_layout = QHBoxLayout()
             self.back_button = QPushButton("← Back")
             self.back_button.setStyleSheet("""
@@ -1115,13 +245,13 @@ class MainWindow(QWidget):
                     border: 1px solid #ccc;
                     border-radius: 4px;
                 }
-                QPushButton:hover {
-                    background-color: #e0e0e0;
-                }
+                QPushButton:hover { background-color: #e0e0e0; }
+                QPushButton:pressed { background-color: #d0d0d0; }
             """)
             self.back_button.clicked.connect(self.navigate_back)
             
             self.path_edit = QLineEdit()
+            self.path_edit.setPlaceholderText("Enter path or browse...")
             self.path_edit.setStyleSheet("""
                 QLineEdit {
                     padding: 5px;
@@ -1131,8 +261,7 @@ class MainWindow(QWidget):
             """)
             self.path_edit.returnPressed.connect(self.navigate_to_path)
             
-            # Re-using refresh button name, but for files (consider renaming if confusion arises)
-            self.refresh_files_button = QPushButton("Refresh") 
+            self.refresh_files_button = QPushButton("Refresh")
             self.refresh_files_button.setStyleSheet("""
                 QPushButton {
                     padding: 5px 10px;
@@ -1140,55 +269,59 @@ class MainWindow(QWidget):
                     border: 1px solid #ccc;
                     border-radius: 4px;
                 }
-                QPushButton:hover {
-                    background-color: #e0e0e0;
-                }
+                QPushButton:hover { background-color: #e0e0e0; }
+                QPushButton:pressed { background-color: #d0d0d0; }
             """)
             self.refresh_files_button.clicked.connect(self.refresh_current_directory)
             
             self.nav_layout.addWidget(self.back_button)
-            self.nav_layout.addWidget(self.path_edit, 1)  # Give path edit more space
-            self.nav_layout.addWidget(self.refresh_files_button) # Use the specific files refresh button
+            self.nav_layout.addWidget(self.path_edit, 1) # Give path edit more space
+            self.nav_layout.addWidget(self.refresh_files_button)
             self.files_layout.addLayout(self.nav_layout)
-            logger.debug("MainWindow._init_ui(): Navigation bar created.")
             
-            # File browser with improved styling
+            # File browser tree
             self.files_tree = FileBrowser()
             self.files_tree.setStyleSheet("""
                 QTreeWidget {
                     border: 1px solid #ccc;
                     border-radius: 4px;
+                    background-color: #f9f9f9;
                 }
                 QTreeWidget::item {
                     padding: 4px;
                 }
                 QTreeWidget::item:selected {
                     background-color: #e0e0e0;
+                    color: black;
                 }
             """)
             self.files_tree.itemDoubleClicked.connect(self.on_item_double_clicked)
             self.files_layout.addWidget(self.files_tree)
-            logger.debug("MainWindow._init_ui(): File browser tree created.")
             
-            # File operation buttons with improved styling
+            # File operation buttons (Download/Upload)
             self.files_buttons = QHBoxLayout()
             self.download_button = QPushButton("Download Selected")
-            self.upload_button = QPushButton("Upload File")
+            self.upload_button = QPushButton("Upload File/Folder") # Consolidated button
             
             for button in [self.download_button, self.upload_button]:
                 button.setStyleSheet("""
                     QPushButton {
                         padding: 8px 15px;
-                        background-color: #4CAF50;
+                        background-color: #4CAF50; /* Green */
                         color: white;
                         border: none;
                         border-radius: 4px;
+                        font-weight: bold;
                     }
                     QPushButton:hover {
                         background-color: #45a049;
                     }
+                    QPushButton:pressed {
+                        background-color: #3e8e41;
+                    }
                     QPushButton:disabled {
                         background-color: #cccccc;
+                        color: #666666;
                     }
                 """)
             
@@ -1198,638 +331,630 @@ class MainWindow(QWidget):
             self.files_buttons.addWidget(self.download_button)
             self.files_buttons.addWidget(self.upload_button)
             self.files_layout.addLayout(self.files_buttons)
-            logger.debug("MainWindow._init_ui(): File operation buttons created.")
             
-            # Progress bar with improved styling
+            # Progress bar for transfers
             self.progress_bar = QProgressBar()
             self.progress_bar.setStyleSheet("""
                 QProgressBar {
                     border: 1px solid #ccc;
                     border-radius: 4px;
                     text-align: center;
-                    height: 20px;
+                    height: 25px; /* Slightly taller */
+                    font-weight: bold;
                 }
                 QProgressBar::chunk {
                     background-color: #4CAF50;
                     border-radius: 3px;
                 }
             """)
-            self.progress_bar.setVisible(False)
+            self.progress_bar.setVisible(False) # Hidden by default
             self.files_layout.addWidget(self.progress_bar)
-            logger.debug("MainWindow._init_ui(): Progress bar created.")
             
-            # Add panels to splitter with improved sizing
             self.splitter.addWidget(self.peers_panel)
             self.splitter.addWidget(self.files_panel)
-            self.splitter.setSizes([250, 950])  # Adjusted panel sizes
+            self.splitter.setSizes([250, 950]) # Initial panel sizes
             self.layout.addWidget(self.splitter)
-            logger.debug("MainWindow._init_ui(): Splitter configured and added to layout.")
             
             self.setLayout(self.layout)
-            logger.debug("MainWindow._init_ui(): Layout set for main window.")
             logger.info("MainWindow._init_ui() end.")
         except Exception as e:
             logger.critical(f"Error during MainWindow UI initialization (_init_ui): {str(e)}", exc_info=True)
-            raise # Re-raise to propagate to __init__ and then main()
+            raise # Re-raise to propagate
+
+    def _show_security_settings_dialog(self):
+        """Opens the dialog for security settings."""
+        dialog = SecuritySettingsDialog(self)
+        dialog.exec_()
 
     def navigate_back(self):
-        """Navigate to the previous directory"""
+        """Navigate to the previous directory or up to the drive list/system root."""
         if self.path_history:
             self.current_path = self.path_history.pop()
             self.refresh_current_directory()
+        elif self.current_path != "/": # If at a drive root (e.g. C:/) and no history, go to "/"
+            self.current_path = "/"
+            self.refresh_current_directory()
 
     def navigate_to_path(self):
-        """Navigate to the path entered in the path edit"""
+        """Navigate to the path entered in the path edit field."""
         path = self.path_edit.text()
         if path:
-            self.path_history.append(self.current_path)
-            self.current_path = path
-            self.refresh_current_directory()
+            # Ensure the path starts with a '/' if it's not a Windows drive letter
+            if platform.system() == "Windows" and len(path) == 2 and path[1] == ':' and path[0].isalpha():
+                # This looks like a drive root, e.g., "C:"
+                normalized_path = f"{path.upper()}/"
+            elif not path.startswith('/'):
+                normalized_path = '/' + path
+            else:
+                normalized_path = path
 
-    def on_item_double_clicked(self, item, column):
-        """Handle double click on a file or directory"""
-        path = item.data(0, Qt.UserRole)  # Get the full path
-        is_dir = item.data(0, Qt.UserRole + 1)  # Get if it's a directory
+            # Only append to history if actual path changes
+            if normalized_path != self.current_path:
+                self.path_history.append(self.current_path)
+                self.current_path = normalized_path
+                self.refresh_current_directory()
+
+    def on_item_double_clicked(self, item: QTreeWidgetItem, column: int):
+        """
+        Handles double-clicks on items in the file browser.
+        Navigates into directories. For files, triggers download if selected.
+        """
+        path = item.data(0, Qt.UserRole)  # Get the full path stored in UserRole
+        is_dir = item.data(0, Qt.UserRole + 1) # Get if it's a directory (stored in UserRole + 1)
         
         if is_dir:
-            self.path_history.append(self.current_path)
-            self.current_path = path
-            self.refresh_current_directory()
+            # Only append to history if actual path changes
+            if path != self.current_path:
+                self.path_history.append(self.current_path)
+                self.current_path = path
+                self.refresh_current_directory()
+        else:
+            # If it's a file, trigger download if it's the only one selected
+            if len(self.files_tree.selectedItems()) == 1:
+                self.download_selected_files()
 
     def refresh_current_directory(self):
-        """Refresh the current directory view"""
+        """Updates the path edit and refreshes the file list for the current peer and path."""
         if not self.current_peer:
+            self.files_tree.clear() # Clear files if no peer is selected
+            self.path_edit.setText("")
+            logger.warning("No peer selected to refresh current directory.")
             return
             
         self.path_edit.setText(self.current_path)
         self.refresh_peer_files()
 
     def refresh_peer_files(self):
-        """Refresh the file list for the current directory"""
+        """
+        Fetches and displays the file listing for the current peer and path.
+        Requires a valid authentication token.
+        """
         if not self.current_peer:
-            logger.warning("No peer selected for file refresh")
+            logger.warning("Cannot refresh files: No peer selected.")
+            QMessageBox.information(self, "No Peer Selected", "Please select a peer to browse its files.")
             return
             
-        ip_port = self.current_peer.split("(")[-1].strip(")")
-        ip, port = ip_port.split(":")
+        ip_port_str = self.current_peer.split("(")[-1].strip(")")
+        ip, port_str = ip_port_str.split(":")
+        port = int(port_str)
         
-        # Get token for the peer
+        # Get token for the peer; this might block or show a warning dialog
         token = self.get_peer_token(ip, port)
         if not token:
-            logger.warning("Failed to get token for file refresh")
+            logger.warning(f"Failed to get token for {self.current_peer}, cannot refresh files.")
+            self.files_tree.clear() # Clear existing files if token failed
             return
             
         try:
+            # Make request to peer's /browse endpoint with current_path
             r = requests.get(
                 f"https://{ip}:{port}/browse",
-                params={"path": self.current_path},
+                params={"path": self.current_path}, # Send the full absolute path
                 headers={"Authorization": f"Bearer {token}"},
-                verify=False
+                verify=False, # Disable SSL verification for self-signed certs
+                timeout=10 # Add a timeout
             )
-            if r.ok:
-                items = r.json()
-                self.update_files_tree(items)
-                logger.info(f"Refreshed directory: {self.current_path} ({len(items)} items)")
-            else:
-                logger.warning(f"Failed to get directory listing: {r.status_code} {r.text}")
-                QMessageBox.warning(self, "Error", f"Failed to get directory listing: {r.status_code}")
+            r.raise_for_status() # Raise an HTTPError for bad responses (4xx or 5xx)
+            
+            items = r.json()
+            self.update_files_tree(items)
+            logger.info(f"Refreshed directory '{self.current_path}' on {self.current_peer} ({len(items)} items).")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error fetching directory listing from {self.current_peer} for path '{self.current_path}': {e}", exc_info=True)
+            QMessageBox.warning(self, "Error", f"Failed to get directory listing from {self.current_peer}:\n{e}\n\nCheck path and permissions on the remote peer.")
+            self.files_tree.clear()
         except Exception as e:
-            logger.error(f"Error refreshing files: {str(e)}", exc_info=True)
-            QMessageBox.warning(self, "Error", f"Error refreshing files: {str(e)}")
+            logger.error(f"Unexpected error refreshing files for {self.current_peer} on path '{self.current_path}': {e}", exc_info=True)
+            QMessageBox.warning(self, "Error", f"An unexpected error occurred while refreshing files:\n{e}")
+            self.files_tree.clear()
 
-    def update_files_tree(self, items):
-        """Update the file tree with the list of items"""
-        self.files_tree.clear()
-        for item in items:
+    def update_files_tree(self, items: list[dict]):
+        """Populates the FileBrowser QTreeWidget with the given list of file/folder items."""
+        self.files_tree.clear() # Clear existing items
+        
+        # Sort items: directories first, then files, both alphabetically
+        def sort_key(item):
+            return (not item["is_dir"], item["name"].lower())
+        items.sort(key=sort_key)
+
+        for item_data in items:
             tree_item = QTreeWidgetItem([
-                item["name"],
-                self.files_tree.format_size(item["size"]),
-                self.files_tree.format_date(item["modified"])
+                item_data["name"],
+                self.files_tree.format_size(item_data["size"]), # Use FileBrowser's format_size method
+                self.files_tree.format_date(item_data["modified"]) # Use FileBrowser's format_date method
             ])
-            # Store full path and is_dir in item data
-            tree_item.setData(0, Qt.UserRole, item["path"])
-            tree_item.setData(0, Qt.UserRole + 1, item["is_dir"])
-            # Set icon or style based on type
-            if item["is_dir"]:
-                tree_item.setForeground(0, Qt.blue)
+            # Store full path and is_dir in item data for later retrieval
+            tree_item.setData(0, Qt.UserRole, item_data["path"])
+            tree_item.setData(0, Qt.UserRole + 1, item_data["is_dir"])
+            
+            # Set icon or color based on type
+            if item_data["is_dir"]:
+                tree_item.setForeground(0, Qt.blue) # Directories are blue
+            
             self.files_tree.addTopLevelItem(tree_item)
+        # self.files_tree.sortByColumn(0, Qt.AscendingOrder) # Manual sort applied, so no need for this.
 
     def download_selected_files(self):
-        """Download selected files and folders from the peer"""
+        """
+        Initiates the download of selected files or folders from the current peer.
+        Launches a DownloadProcess in a separate thread.
+        """
         if not self.current_peer:
-            logger.warning("No peer selected for download")
-            QMessageBox.warning(self, "No Peer Selected", "Please select a peer first")
+            logger.warning("Download attempted without selecting a peer.")
+            QMessageBox.warning(self, "No Peer Selected", "Please select a peer first.")
             return
             
         selected_items = self.files_tree.selectedItems()
         if not selected_items:
-            logger.warning("No items selected for download")
-            QMessageBox.warning(self, "No Items Selected", "Please select files or folders to download")
+            logger.warning("No items selected for download.")
+            QMessageBox.warning(self, "No Items Selected", "Please select files or folders to download.")
             return
             
-        # Check if encryption key is loaded before initiating download
-        if security_manager.get_encryption_key() is None:
-            QMessageBox.critical(self, "Security Error", 
+        # Pre-check: Ensure encryption key is loaded before initiating download
+        if self.security_manager.get_encryption_key() is None:
+
+            QMessageBox.critical(self, "Security Error",
                                  "Encryption key not loaded. Cannot download/decrypt files securely.\n"
                                  "Please ensure you've entered the correct security code on startup.")
             logger.error("Download blocked: Encryption key not loaded.")
             return
 
-        # Reset cancellation flag
-        self.is_operation_cancelled = False
+        # Reset cancellation flag for new operation
+        with self._operation_lock:
+            self.is_operation_cancelled = False
             
-        # Get download directory
+        # Prompt user for download directory
         download_dir = QFileDialog.getExistingDirectory(
             self, "Select Download Directory", str(Path.home())
         )
         if not download_dir:
-            logger.info("Download cancelled - no directory selected")
+            logger.info("Download cancelled by user: No directory selected.")
             return
             
-        ip_port = self.current_peer.split("(")[-1].strip(")")
-        ip, port = ip_port.split(":")
+        ip_port_str = self.current_peer.split("(")[-1].strip(")")
+        ip, port_str = ip_port_str.split(":")
+        port = int(port_str)
         
-        # Get token for the peer
+        # Get token for the peer; this might block or show a warning
         token = self.get_peer_token(ip, port)
         if not token:
-            logger.warning("Failed to get token for download")
+            logger.warning("Download aborted due to token failure.")
             return
             
-        # Prepare items list
-        items = []
+        # Prepare items list for the download process
+        items_to_download = [] # List of [full_path_on_peer, original_name]
+        is_any_folder_selected = False
         for item in selected_items:
-            path = item.data(0, Qt.UserRole)
-            name = item.text(0)
-            items.append([path, name])
+            path_on_peer = item.data(0, Qt.UserRole) # This path is now the absolute path from the server
+            original_name = item.text(0)
+            is_dir = item.data(0, Qt.UserRole + 1)
+            items_to_download.append([path_on_peer, original_name])
+            if is_dir:
+                is_any_folder_selected = True # Flag if any folder is selected
         
         # Create and show progress dialog
-        progress = QProgressDialog(
-            "Preparing download...",
-            "Cancel",
-            0, 100,
-            self
+        progress_dialog = QProgressDialog(
+            "Preparing download...", "Cancel", 0, 100, self
         )
-        progress.setWindowTitle("Download Progress")
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.setAutoClose(False)
-        progress.setAutoReset(False)
-        # Set minimum width for the progress dialog
-        progress.setMinimumWidth(400) # Set a fixed minimum width, e.g., 400 pixels
-        progress.canceled.connect(self.cancel_download)
+        progress_dialog.setWindowTitle("Download Progress")
+        progress_dialog.setWindowModality(Qt.WindowModal) # Blocks interaction with main window
+        progress_dialog.setMinimumDuration(0) # Show immediately
+        progress_dialog.setAutoClose(False) # Keep open until explicitly closed
+        progress_dialog.setAutoReset(False)
+        progress_dialog.setMinimumWidth(400) # Ensure it's wide enough for messages
+        progress_dialog.canceled.connect(self.cancel_download) # Connect cancel button
         
-        # Store progress dialog
+        # Store progress dialog and process reference under lock
         with self._operation_lock:
-            self.current_progress = progress
+            self.current_progress = progress_dialog
         
-        # Create and start download process
+        # Create and start DownloadProcess worker
         download_process = DownloadProcess(self)
         download_process.progress.connect(self.update_download_progress)
         download_process.finished.connect(self.handle_download_finished)
-        download_process.cleanup.connect(self.cleanup_download)
+        download_process.cleanup.connect(self.cleanup_download) # Connect for final cleanup
         
-        # Store download process
         with self._operation_lock:
             self.current_download = download_process
         
-        # Start the download
-        is_folder = any(item.data(0, Qt.UserRole + 1) for item in selected_items)
-        # The encryption key will now be passed through the DownloadProcess
-        download_process.start_download(ip, port, token, items, download_dir, is_folder)
+        # Start the external download process
+        download_process.start_download(ip, port, token, items_to_download, download_dir, is_any_folder_selected)
+        
+        # Show progress bar in main window for ongoing visual feedback (optional, as dialog also shows)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("Initializing download...")
 
-    def update_download_progress(self, value, message):
-        """Update the progress dialog with download progress"""
+    def update_download_progress(self, value: int, message: str):
+        """Updates the progress dialog and main window's progress bar during download."""
         with self._operation_lock:
             if self.is_operation_cancelled:
-                return
+                return # Ignore updates if cancelled
                 
-            if not self.current_progress:
-                logger.debug("Progress dialog not available")
-                return
-                
-            try:
-                if not self.current_progress.wasCanceled():
+            if self.current_progress and not self.current_progress.wasCanceled():
+                try:
                     self.current_progress.setValue(value)
                     self.current_progress.setLabelText(message)
-            except RuntimeError as e:
-                logger.warning(f"Progress dialog error: {str(e)}")
-                self._handle_operation_error()
-            except Exception as e:
-                logger.error(f"Unexpected error updating progress: {str(e)}")
-                self._handle_operation_error()
+                except RuntimeError as e: # Handle potential RuntimeError if dialog is closed unexpectedly
+                    logger.warning(f"Progress dialog error during update: {e}. Initiating error handling.")
+                    self._handle_operation_error()
+                except Exception as e:
+                    logger.error(f"Unexpected error updating download progress: {e}", exc_info=True)
+                    self._handle_operation_error()
             
-    def _handle_operation_error(self):
-        """Handle operation errors consistently by stopping the operation and cleaning up."""
-        logger.error("An operation error was detected, initiating cleanup.")
-        with self._operation_lock:
-            if not self.is_operation_cancelled: # Prevent multiple cancellations
-                self.is_operation_cancelled = True
-                
-                # Stop download if active
-                if self.current_download and self.current_download.is_running: # Check is_running
-                    try:
-                        logger.info("Stopping download process due to operation error.")
-                        self.current_download.stop() # Use the refined stop method
-                    except Exception as e:
-                        logger.error(f"Error stopping download process on error: {str(e)}")
-                
-                # Stop upload if active
-                if self.current_worker and self.current_worker.isRunning():
-                    try:
-                        logger.info("Cancelling upload worker due to operation error.")
-                        self.current_worker.cancel()
-                        # Worker should emit finished signal which triggers cleanup_upload
-                    except Exception as e:
-                        logger.error(f"Error cancelling upload worker on error: {str(e)}")
-                
-                # Close progress dialog immediately if it exists
-                if self.current_progress:
-                    try:
-                        self.current_progress.close()
-                        self.current_progress = None # Clear reference
-                    except Exception as e:
-                        logger.error(f"Error closing progress dialog on error: {str(e)}")
-            
-    def cancel_download(self):
-        """Handle download cancellation"""
-        try:
-            with self._operation_lock:
-                if not self.is_operation_cancelled:
-                    logger.info("Download cancellation requested")
-                    self.is_operation_cancelled = True
-                    
-                    # Store references before cleanup
-                    download = self.current_download
-                    progress = self.current_progress
-                    
-                    # Clear references first
-                    self.current_download = None
-                    self.current_progress = None
-                    
-                    # Stop the download process
-                    if download:
-                        download.stop()
-                    
-                    # Close progress dialog
-                    if progress:
-                        try:
-                            progress.close()
-                        except Exception as e:
-                            logger.error(f"Error closing progress dialog: {str(e)}")
-        except Exception as e:
-            logger.error(f"Error in cancel_download: {str(e)}")
+            # Update main window's progress bar (less frequent updates than dialog)
+            if self.progress_bar.isVisible():
+                self.progress_bar.setValue(value)
+                self.progress_bar.setFormat(f"Download: {message} ({value}%)")
 
-    def handle_download_finished(self, success, message):
-        """Handle download completion"""
-        try:
-            # Show completion message in a non-blocking way
-            if success:
-                QTimer.singleShot(0, lambda: QMessageBox.information(self, "Success", message))
-            else:
-                QTimer.singleShot(0, lambda: QMessageBox.warning(self, "Download Failed", message))
-                
-            # Clean up
-            with self._operation_lock:
-                if self.current_progress:
-                    try:
-                        self.current_progress.close()
-                    except Exception as e:
-                        logger.error(f"Error closing progress dialog: {str(e)}")
-                    finally:
-                        self.current_progress = None
-                        
-                self.current_download = None
-                self.is_operation_cancelled = False
-        except Exception as e:
-            logger.error(f"Error in handle_download_finished: {str(e)}")
+    def handle_download_finished(self, success: bool, message: str):
+        """Handles the completion of a download operation (success or failure)."""
+        logger.info(f"Download finished. Success: {success}, Message: {message}")
+        # Show message box in a non-blocking way (after current event loop iteration)
+        if success:
+            QTimer.singleShot(0, lambda: QMessageBox.information(self, "Success", message))
+        else:
+            QTimer.singleShot(0, lambda: QMessageBox.warning(self, "Download Failed", message))
+            
+        self.cleanup_download() # Trigger cleanup directly when finished signal is received
 
     def cleanup_download(self):
-        """Clean up download resources"""
-        logger.debug("Cleanup_download called.")
+        """
+        Cleans up resources associated with a completed or cancelled download operation.
+        Called when DownloadProcess.cleanup signal is emitted.
+        """
+        logger.debug("cleanup_download called.")
         with self._operation_lock:
+            if self._cleanup_in_progress: # Prevent re-entry if already cleaning up
+                logger.debug("Cleanup already in progress for download, skipping re-entry.")
+                return
+            self._cleanup_in_progress = True
+
+            # Get references and then clear them
             progress_dialog = self.current_progress
             download_process = self.current_download
             
             self.current_progress = None
             self.current_download = None
-            
+            self.is_operation_cancelled = False # Reset for next operation
+
             if progress_dialog:
                 try:
                     logger.debug("Closing progress dialog in cleanup_download.")
                     progress_dialog.close()
                 except Exception as e:
-                    logger.error(f"Error closing progress dialog in cleanup_download: {str(e)}")
+                    logger.error(f"Error closing progress dialog in cleanup_download: {e}")
                     
             if download_process:
                 try:
                     logger.debug("Stopping and deleting download process in cleanup_download.")
                     if download_process.process.state() == QProcess.Running:
-                        download_process.stop() # Use the new stop method
-                    download_process.deleteLater() # Important for QObject cleanup
+                        download_process.stop() # Ensure process is terminated
+                    download_process.deleteLater() # Schedule QObject for deletion
                 except Exception as e:
-                    logger.error(f"Error cleaning up download process in cleanup_download: {str(e)}")
+                    logger.error(f"Error cleaning up download process in cleanup_download: {e}")
                     
-            self.is_operation_cancelled = False # Reset
+            self.progress_bar.setVisible(False) # Hide main window progress bar
+            self.progress_bar.setValue(0)
+            self.progress_bar.setFormat("")
+
+            self._cleanup_in_progress = False # Reset flag
             logger.debug("Download resources cleaned up.")
-            
+
+    def cancel_download(self):
+        """Initiates cancellation of the current download operation."""
+        logger.info("Download cancellation requested by user via progress dialog.")
+        with self._operation_lock:
+            if not self.is_operation_cancelled:
+                self.is_operation_cancelled = True # Set flag first
+                
+                if self.current_download:
+                    logger.info("Signaling current_download process to stop.")
+                    self.current_download.stop() # This should trigger cleanup_download eventually
+                
+                if self.current_progress:
+                    try:
+                        self.current_progress.close() # Close dialog immediately
+                    except Exception as e:
+                        logger.error(f"Error closing progress dialog during download cancel: {e}")
+                
+                logger.info("Download cancellation processed.")
+
     def upload_file_to_peer(self):
-        """Upload files or folders to the selected peer"""
-        # Reset cancellation flag
-        self.is_operation_cancelled = False
-        
-        selected = self.peers_list.currentItem()
-        if not selected:
-            logger.warning("Upload attempted without selecting a peer")
-            QMessageBox.warning(self, "No Peer Selected", 
-                "Please select a peer to upload to")
+        """
+        Prompts the user to select a file or folder and uploads it to the selected peer.
+        Launches an UploadWorker in a separate thread.
+        """
+        # Reset cancellation flag for new operation
+        with self._operation_lock:
+            self.is_operation_cancelled = False
+            
+        selected_peer_item = self.peers_list.currentItem()
+        if not selected_peer_item:
+            logger.warning("Upload attempted without selecting a peer.")
+            QMessageBox.warning(self, "No Peer Selected", "Please select a peer to upload to.")
             return
 
-        # Check if encryption key is loaded before initiating upload
-        if security_manager.get_encryption_key() is None:
-            QMessageBox.critical(self, "Security Error", 
+        # Pre-check: Ensure encryption key is loaded before initiating upload
+        if self.security_manager.get_encryption_key() is None:
+            QMessageBox.critical(self, "Security Error",
                                  "Encryption key not loaded. Cannot upload/encrypt files securely.\n"
                                  "Please ensure you've entered the correct security code on startup.")
             logger.error("Upload blocked: Encryption key not loaded.")
             return
 
-        peer_text = selected.text()
+        peer_text = selected_peer_item.text()
         logger.info(f"Selected peer for upload: {peer_text}")
-        ip_port = peer_text.split("(")[-1].strip(")")
-        ip, port = ip_port.split(":")
-        logger.debug(f"Peer address: {ip}:{port}")
-
-        # Get token for the peer
+        ip_port_str = peer_text.split("(")[-1].strip(")")
+        ip, port_str = ip_port_str.split(":")
+        port = int(port_str)
+        
+        # Get token for the peer; this might block or show a warning
         token = self.get_peer_token(ip, port)
         if not token:
-            logger.warning("Upload aborted due to token failure")
+            logger.warning("Upload aborted due to token failure.")
             return
-        logger.debug("Successfully obtained token for upload")
+        logger.debug("Successfully obtained token for upload.")
 
-        # Ask user what to upload with more descriptive text
+        # Ask user what to upload (file or folder)
         msg_box = QMessageBox(self)
         msg_box.setIcon(QMessageBox.Question)
         msg_box.setWindowTitle("Select Upload Type")
-        msg_box.setText("Would you like to upload a single file?")
-        msg_box.setInformativeText("Click 'Upload File' to upload a single file.\nClick 'Upload Folder' to upload a folder with all its contents.")
+        msg_box.setText("Would you like to upload a single file or an entire folder?")
+        msg_box.setInformativeText("Click 'Upload File' for a single file.\nClick 'Upload Folder' for a folder and its contents.")
 
         upload_file_button = msg_box.addButton("Upload File", QMessageBox.AcceptRole)
         upload_folder_button = msg_box.addButton("Upload Folder", QMessageBox.RejectRole)
-        msg_box.setStandardButtons(QMessageBox.Cancel) # Add a Cancel button explicitly
-
-        msg_box.setDefaultButton(upload_file_button) # Set 'Upload File' as default
+        msg_box.setStandardButtons(QMessageBox.Cancel)
+        msg_box.setDefaultButton(upload_file_button)
         msg_box.exec_()
         
         clicked_button = msg_box.clickedButton()
 
         is_folder = False
+        source_path = None
         if clicked_button == upload_folder_button:
             is_folder = True
-        elif clicked_button == QMessageBox.Cancel:
-            logger.info("Upload cancelled - dialog closed by user.")
-            return # Exit the upload function early
-
-        # Get source path
-        if is_folder:
             source_path = QFileDialog.getExistingDirectory(
                 self, "Select Folder to Upload (All contents will be included)"
             )
-        else:
+        elif clicked_button == upload_file_button:
             source_path, _ = QFileDialog.getOpenFileName(
                 self, "Select File to Upload"
             )
-            
+        elif clicked_button == msg_box.button(QMessageBox.Cancel): # Explicitly check for Cancel button
+            logger.info("Upload cancelled by user: Type selection dialog closed.")
+            return # Exit the upload function early
+
         if not source_path:
-            logger.info("Upload cancelled - no source selected")
+            logger.info("Upload cancelled by user: No source file/folder selected.")
             return
         logger.info(f"Selected source for upload: {source_path}")
 
-        # Get destination path
+        # Get destination path on peer - now allows full absolute paths
         dialog = UploadDialog(self, is_folder)
-        if dialog.exec_() != QDialog.DialogCode.Accepted:
-            logger.info("Upload cancelled - no destination selected")
+        # Set initial path in dialog to current browsed path
+        dialog.path_edit.setText(self.current_path)
+        if dialog.exec_() != QDialog.Accepted: # Use QDialog.Accepted enum
+            logger.info("Upload cancelled by user: No destination selected.")
             return
             
         dest_path = dialog.get_destination_path()
-        logger.info(f"Selected destination path: {dest_path}")
+        logger.info(f"Selected destination path on peer: {dest_path}")
 
         # Create and show progress dialog
-        progress = QProgressDialog(
-            "Preparing upload...",
-            "Cancel",
-            0, 100,
-            self
+        progress_dialog = QProgressDialog(
+            "Preparing upload...", "Cancel", 0, 100, self
         )
-        progress.setWindowTitle("Upload Progress")
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.setAutoClose(False)
-        progress.setAutoReset(False)
-        progress.setMinimumWidth(400) # Set a fixed minimum width, e.g., 400 pixels
-        progress.canceled.connect(self.cancel_upload)
+        progress_dialog.setWindowTitle("Upload Progress")
+        progress_dialog.setWindowModality(Qt.WindowModal)
+        progress_dialog.setMinimumDuration(0)
+        progress_dialog.setAutoClose(False)
+        progress_dialog.setAutoReset(False)
+        progress_dialog.setMinimumWidth(400)
+        progress_dialog.canceled.connect(self.cancel_upload) # Connect cancel button
         
-        # Store progress dialog
+        # Store progress dialog and worker reference under lock
         with self._operation_lock:
-            self.current_progress = progress
+            self.current_progress = progress_dialog
         
-        # Create and start upload worker
-        worker = UploadWorker(ip, port, token, source_path, dest_path, is_folder)
+        # Create and start UploadWorker thread
+        worker = UploadWorker(ip, port, token, source_path, dest_path, is_folder, parent=self)
         
-        # Store worker thread
         with self._operation_lock:
             self.current_worker = worker
         
-        # Connect signals
+        # Connect signals from worker to update UI
         worker.progress.connect(self.update_upload_progress)
         worker.finished.connect(self.handle_upload_finished)
         
-        # Start the worker
-        worker.start()
+        worker.start() # Start the worker thread
+
+        # Show main window's progress bar
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("Initializing upload...")
         
-    def update_upload_progress(self, value, message):
-        """Update the progress dialog with upload progress"""
+    def update_upload_progress(self, value: int, message: str):
+        """Updates the progress dialog and main window's progress bar during upload."""
         with self._operation_lock:
             if self.is_operation_cancelled:
-                return
+                return # Ignore updates if cancelled
                 
-            if not self.current_progress:
-                logger.debug("Progress dialog not available")
-                return
-                
-            try:
-                if not self.current_progress.wasCanceled():
+            if self.current_progress and not self.current_progress.wasCanceled():
+                try:
                     self.current_progress.setValue(value)
                     self.current_progress.setLabelText(message)
-            except RuntimeError as e:
-                logger.warning(f"Progress dialog error: {str(e)}")
-                self._handle_operation_error()
-            except Exception as e:
-                logger.error(f"Unexpected error updating progress: {str(e)}")
-                self._handle_operation_error()
+                except RuntimeError as e:
+                    logger.warning(f"Progress dialog error during update: {e}. Initiating error handling.")
+                    self._handle_operation_error()
+                except Exception as e:
+                    logger.error(f"Unexpected error updating upload progress: {e}", exc_info=True)
+                    self._handle_operation_error()
             
-    def handle_upload_finished(self, success, message):
-        """Handle upload completion"""
-        try:
-            # Show completion message in a non-blocking way
-            if success:
-                QTimer.singleShot(0, lambda: QMessageBox.information(self, "Success", message))
-            else:
-                QTimer.singleShot(0, lambda: QMessageBox.warning(self, "Upload Failed", message))
-            # Ensure cleanup happens after the worker signals it's finished
-            self.cleanup_upload() 
-        except Exception as e:
-            logger.error(f"Error in handle_upload_finished: {str(e)}")
+            # Update main window's progress bar
+            if self.progress_bar.isVisible():
+                self.progress_bar.setValue(value)
+                self.progress_bar.setFormat(f"Upload: {message} ({value}%)")
+            
+    def handle_upload_finished(self, success: bool, message: str):
+        """Handles the completion of an upload operation (success or failure)."""
+        logger.info(f"Upload finished. Success: {success}, Message: {message}")
+        # Show message box in a non-blocking way
+        if success:
+            QTimer.singleShot(0, lambda: QMessageBox.information(self, "Success", message))
+        else:
+            QTimer.singleShot(0, lambda: QMessageBox.warning(self, "Upload Failed", message))
+        
+        self.cleanup_upload() # Trigger cleanup directly when finished signal is received
 
     def cleanup_upload(self):
-        """Clean up upload resources after worker has finished or was cancelled."""
-        logger.debug("Cleanup_upload called.")
+        """
+        Cleans up resources associated with a completed or cancelled upload operation.
+        Called when UploadWorker.finished signal is received.
+        """
+        logger.debug("cleanup_upload called.")
         with self._operation_lock:
+            if self._cleanup_in_progress:
+                logger.debug("Cleanup already in progress for upload, skipping re-entry.")
+                return
+            self._cleanup_in_progress = True
+
+            # Get references and then clear them
             progress_dialog = self.current_progress
             worker = self.current_worker
             
             self.current_progress = None
             self.current_worker = None
-            
+            self.is_operation_cancelled = False # Reset for next operation
+
             if progress_dialog:
                 try:
                     logger.debug("Closing progress dialog in cleanup_upload.")
                     progress_dialog.close()
                 except Exception as e:
-                    logger.error(f"Error closing progress dialog in cleanup_upload: {str(e)}")
+                    logger.error(f"Error closing progress dialog in cleanup_upload: {e}")
             
             if worker:
                 try:
+                    logger.debug("Terminating worker in cleanup_upload if still running.")
                     if worker.isRunning():
-                        logger.warning("Upload worker was still running during cleanup_upload. Attempting to wait.")
-                        worker.wait(500) # Brief wait
-                        if worker.isRunning():
-                             logger.warning("Terminating worker in cleanup_upload as it's still running.")
-                             worker.terminate() # Last resort
-                    logger.debug("Deleting worker in cleanup_upload.")
-                    worker.deleteLater() # Important for QObject cleanup
+                        worker.terminate() # Force terminate if still running
+                        worker.wait(500) # Give it a moment
+                    worker.deleteLater() # Schedule QObject for deletion
                 except Exception as e:
-                    logger.error(f"Error cleaning up worker in cleanup_upload: {str(e)}")
+                    logger.error(f"Error cleaning up upload worker in cleanup_upload: {e}")
                     
-            self.is_operation_cancelled = False # Reset for next operation
-            logger.debug("Upload resources cleaned up.")
+            self.progress_bar.setVisible(False) # Hide main window progress bar
+            self.progress_bar.setValue(0)
+            self.progress_bar.setFormat("")
             
+            self._cleanup_in_progress = False # Reset flag
+            logger.debug("Upload resources cleaned up.")
+
     def cancel_upload(self):
-        """Handle upload cancellation"""
-        logger.info("Upload cancellation requested by user.")
-        try:
-            with self._operation_lock:
-                if not self.is_operation_cancelled:
-                    self.is_operation_cancelled = True
-                    
-                    worker = self.current_worker
-                    progress_dialog = self.current_progress # Renamed for clarity
-                    
-                    self.current_worker = None
-                    self.current_progress = None
-                    
-                    if worker and worker.isRunning():
-                        logger.info("Signaling upload worker to cancel...")
-                        worker.cancel() # This should signal the worker's internal loop
-                        # Worker should clean itself up on cancel by emitting finished signal
-                    
-                    if progress_dialog:
-                        try:
-                            progress_dialog.close()
-                        except Exception as e:
-                            logger.error(f"Error closing progress dialog during upload cancel: {str(e)}")
-            logger.info("Upload cancellation processed.")
-        except Exception as e:
-            logger.error(f"Error in cancel_upload: {str(e)}", exc_info=True)
-
-    def _process_ui_updates(self):
-        """Process pending UI updates and cleanup with improved performance"""
-        try:
-            logger.debug("MainWindow._process_ui_updates() called.")
-            with self._operation_lock:
-                # Check download process
-                if self.current_download and not self.current_download.process.state() == QProcess.Running:
-                    logger.debug("MainWindow._process_ui_updates(): Download process not running, initiating cleanup.")
-                    self._cleanup_worker()
+        """Initiates cancellation of the current upload operation."""
+        logger.info("Upload cancellation requested by user via progress dialog.")
+        with self._operation_lock:
+            if not self.is_operation_cancelled:
+                self.is_operation_cancelled = True # Set flag first
                 
-                # Check upload worker
-                if self.current_worker and not self.current_worker.isRunning():
-                    logger.debug("MainWindow._process_ui_updates(): Upload worker not running, initiating cleanup.")
-                    self.cleanup_upload()
-                    
-                # Process events less frequently
-                if not hasattr(self, '_last_event_process'):
-                    self._last_event_process = 0
-                    
-                current_time = time.time()
-                if current_time - self._last_event_process >= 0.1:  # Process events every 100ms
-                    # QApplication.processEvents() can sometimes cause issues if called too aggressively
-                    # or during a deep crash. Let's rely on exec_() and the main loop.
-                    pass # Removed for now to simplify and observe
-                    self._last_event_process = current_time
-        except Exception as e:
-            logger.critical(f"CRITICAL ERROR in _process_ui_updates: {str(e)}", exc_info=True)
-            # Attempt to signal an error to the main thread or force exit if necessary
-            # Note: Directly calling QApplication.quit() or sys.exit() from a timer callback
-            # can sometimes lead to recursive crashes or ungraceful shutdowns.
-            # It's better to let the main loop handle the exit.
-            QMessageBox.critical(self, "UI Update Error", f"A critical error occurred in UI updates: {str(e)}")
-
-
-    def _delayed_cleanup(self):
-        """Perform cleanup operations in a non-blocking way"""
-        try:
-            logger.debug("MainWindow._delayed_cleanup() called.")
-            with self._operation_lock:
-                # Clean up download process
-                if self.current_download:
-                    try:
-                        if self.current_download.process.state() == QProcess.Running:
-                            self.current_download.stop()
-                        self.current_download.deleteLater()
-                        logger.debug("MainWindow._delayed_cleanup(): Download process cleaned.")
-                    except Exception as e:
-                        logger.error(f"Error cleaning up download process: {str(e)}")
-                    finally:
-                        self.current_download = None
-
-                # Clean up upload worker
                 if self.current_worker:
+                    logger.info("Signaling upload worker to cancel...")
+                    self.current_worker.cancel() # This sets the internal cancellation flag
+                    # The worker's run() method should detect this and emit finished signal
+                
+                if self.current_progress:
                     try:
-                        if self.current_worker.isRunning():
-                            self.current_worker.terminate()
-                            self.current_worker.wait(1000)
-                        self.current_worker.deleteLater()
-                        logger.debug("MainWindow._delayed_cleanup(): Upload worker cleaned.")
+                        self.current_progress.close() # Close dialog immediately
                     except Exception as e:
-                        logger.error(f"Error cleaning up upload worker: {str(e)}")
-                    finally:
-                        self.current_worker = None
+                        logger.error(f"Error closing progress dialog during upload cancel: {e}")
+                
+                logger.info("Upload cancellation processed.")
 
-                # Clean up progress dialog
+    def _handle_operation_error(self):
+        """
+        A centralized handler for unexpected errors during file transfer operations.
+        Attempts to stop ongoing operations and clean up resources.
+        """
+        logger.error("An operation error was detected, initiating cleanup.")
+        with self._operation_lock:
+            if not self.is_operation_cancelled: # Prevent multiple error handlers from acting
+                self.is_operation_cancelled = True
+                
+                # Stop download if active
+                if self.current_download and self.current_download.is_running:
+                    logger.info("Stopping download process due to operation error.")
+                    self.current_download.stop() # This will trigger cleanup_download
+                
+                # Stop upload if active
+                if self.current_worker and self.current_worker.isRunning():
+                    logger.info("Cancelling upload worker due to operation error.")
+                    self.current_worker.cancel() # This will trigger handle_upload_finished and cleanup_upload
+                
+                # Close progress dialog immediately if it exists and wasn't explicitly cancelled
                 if self.current_progress:
                     try:
                         self.current_progress.close()
-                        logger.debug("MainWindow._delayed_cleanup(): Progress dialog closed.")
                     except Exception as e:
-                        logger.error(f"Error closing progress dialog: {str(e)}")
+                        logger.error(f"Error closing progress dialog on operation error: {e}")
                     finally:
-                        self.current_progress = None
+                        self.current_progress = None # Clear reference
+                        
+                self.progress_bar.setVisible(False)
+                self.progress_bar.setValue(0)
+                self.progress_bar.setFormat("")
 
-                self.is_operation_cancelled = False
-                logger.debug("MainWindow._delayed_cleanup(): is_operation_cancelled reset.")
+    def _process_ui_updates(self):
+        """
+        Periodically checks for and processes UI-related updates,
+        including checking worker/process states for cleanup.
+        """
+        # This timer is mainly for ensuring cleanup happens even if signals are missed
+        # or for processing very low-frequency UI updates.
+        # It's less about raw performance and more about state synchronization.
+        logger.debug("MainWindow._process_ui_updates() called.")
+        
+        # Check download process state for proactive cleanup if it stopped unexpectedly
+        with self._operation_lock:
+            if self.current_download and not self.current_download.is_running and not self._cleanup_in_progress:
+                logger.debug("Download process detected as not running, initiating cleanup.")
+                self.cleanup_download() # Call cleanup directly
                 
-                # Process events to keep UI responsive - reconsidered, removing explicit call here.
-                # QApplication.processEvents()
-        except Exception as e:
-            logger.critical(f"CRITICAL ERROR in _delayed_cleanup: {str(e)}", exc_info=True)
-            QMessageBox.critical(self, "Cleanup Error", f"A critical error occurred during cleanup: {str(e)}")
+            # Check upload worker state for proactive cleanup
+            if self.current_worker and not self.current_worker.isRunning() and not self._cleanup_in_progress:
+                logger.debug("Upload worker detected as not running, initiating cleanup.")
+                self.cleanup_upload() # Call cleanup directly
 
-
-    def closeEvent(self, event):
-        """Handle window close with improved cleanup"""
+    def closeEvent(self, event: QEvent):
+        """
+        Handles the window close event, ensuring all background operations and threads
+        are gracefully shut down before the application exits.
+        """
         logger.info("Close event triggered. Starting graceful shutdown.")
         
         try:
-            # Stop all timers first
+            # Stop all active timers
             for timer_name in ['timer', '_ui_update_timer', '_cleanup_timer', 'peer_health_check_timer']:
                 if hasattr(self, timer_name):
                     timer = getattr(self, timer_name)
@@ -1837,344 +962,331 @@ class MainWindow(QWidget):
                         timer.stop()
                         logger.debug(f"Stopped timer: {timer_name}")
             
-            # Stop discovery service
-            self._discovery_running = False
-            if hasattr(self, 'discovery'):
-                self.discovery.unregister()
+            # Signal discovery thread to stop and unregister services
+            self._discovery_running = False # Set flag for discovery thread to exit its loop
+            if hasattr(self, 'discovery') and self.discovery:
+                logger.info("Calling discovery.unregister()...")
+                self.discovery.unregister() # This will block until Zeroconf resources are released
                 logger.info("Discovery service unregistered.")
             
-            # Cancel any ongoing operations with timeout
-            if hasattr(self, 'current_worker') and self.current_worker:
-                logger.info("Cancelling current_worker if active...")
-                self.current_worker.cancel()
-                if not self.current_worker.wait(3000):  # Wait up to 3 seconds
-                    logger.warning("Worker did not finish in time, forcing termination")
+            # Cancel any ongoing upload/download operations with a timeout
+            if hasattr(self, 'current_worker') and self.current_worker and self.current_worker.isRunning():
+                logger.info("Cancelling current_worker if active during shutdown...")
+                self.current_worker.cancel() # Signal worker to cancel
+                if not self.current_worker.wait(3000): # Wait up to 3 seconds for it to finish
+                    logger.warning("Upload worker did not finish gracefully, terminating.")
                     self.current_worker.terminate()
             
             if hasattr(self, 'current_download') and self.current_download and self.current_download.is_running:
-                logger.info("Stopping current_download process if active...")
-                self.current_download.stop()
-                if not self.current_download.process.waitForFinished(3000):
-                    logger.warning("Download process did not finish in time after stop.")
-
+                logger.info("Stopping current_download process if active during shutdown...")
+                self.current_download.stop() # Signal process to stop
+                if not self.current_download.process.waitForFinished(3000): # Wait up to 3 seconds
+                    logger.warning("Download process did not finish gracefully, forcing close.")
+            
             # Clear active token fetchers (stop any running threads)
-            for peer_text in list(self.active_token_fetchers.keys()):
+            for peer_text in list(self.active_token_fetchers.keys()): # Iterate over copy
                 fetcher = self.active_token_fetchers.pop(peer_text, None)
                 if fetcher and fetcher.isRunning():
                     logger.debug(f"Stopping active TokenFetcher for {peer_text} during shutdown.")
                     fetcher.quit() # Request thread to exit
                     fetcher.wait(1000) # Wait for it to finish gracefully
-
-            # Process any pending events to ensure UI updates finish
+                    fetcher.deleteLater() # Clean up QObject
+            
+            # Force any pending UI events to process one last time
             QApplication.processEvents()
             
-            # Accept the close event
-            event.accept()
-            
-            # Start final cleanup
-            logger.info("Starting final cleanup within closeEvent...")
+            logger.info("All background operations requested to stop. Accepting close event.")
+            event.accept() # Accept the close event, allowing the application to exit
             
         except Exception as e:
             logger.critical(f"CRITICAL ERROR during shutdown (closeEvent): {str(e)}", exc_info=True)
-            QMessageBox.critical(self, "Shutdown Error", f"A critical error occurred during shutdown: {str(e)}")
-            event.ignore() 
+            QMessageBox.critical(self, "Shutdown Error", f"A critical error occurred during application shutdown: {str(e)}")
+            event.ignore() # Prevent immediate exit if a critical error occurs during cleanup
 
-    def on_peer_selected(self, item):
-        """Handle peer selection"""
+    def on_peer_selected(self, item: QListWidgetItem):
+        """
+        Handles selection of a peer in the peer list.
+        Sets the current peer and refreshes the file browser for that peer.
+        """
         self.current_peer = item.text()
+        self.current_path = "/" # Reset path to system root/drive list when a new peer is selected
+        self.path_history = [] # Clear path history
+        logger.info(f"Peer selected: {self.current_peer}. Resetting path to '/'.")
         self.refresh_peer_files()
 
     def update_peer_list(self):
-        """Update the peer list with improved error handling and status updates"""
+        """
+        Fetches the latest list of peers from the discovery service
+        and updates the peer list in the UI, initiating online/token checks.
+        """
         try:
             current_time = datetime.now()
+            # Throttle updates to avoid excessive processing if called frequently
             if (current_time - self.last_peer_update).total_seconds() < self.peer_update_interval:
-                return  # Skip update if not enough time has passed
+                return
                 
             self.last_peer_update = current_time
-            peers = self.discovery.get_peers()
-            logger.debug(f"update_peer_list: Discovered peers: {peers.keys()}")
+            peers_from_discovery = self.discovery.get_peers() # Get raw {device_id: (ip, port)}
+            logger.debug(f"update_peer_list: Discovered peers from discovery: {peers_from_discovery.keys()}")
             
-            # Update peer status
-            if not peers:
+            # Update peer status label
+            if not peers_from_discovery:
                 self.peer_status.setText("No peers discovered")
-                self.peer_status.setStyleSheet("color: gray;")
+                self.peer_status.setStyleSheet("color: gray; font-weight: bold;")
             else:
-                self.peer_status.setText(f"Discovered {len(peers)} peer(s)")
-                self.peer_status.setStyleSheet("color: black;")
+                self.peer_status.setText(f"Discovered {len(peers_from_discovery)} peer(s)")
+                self.peer_status.setStyleSheet("color: black; font-weight: bold;")
             
-            # Get current items for comparison
-            current_items = set()
+            # Build current UI items for comparison
+            current_ui_peers = {} # {peer_text: QListWidgetItem}
             for i in range(self.peers_list.count()):
                 item = self.peers_list.item(i)
                 if item:
-                    current_items.add(item.text())
+                    current_ui_peers[item.text()] = item
             
-            # Track new peers to add
-            new_peers = set()
+            discovered_peer_texts = set() # To track which discovered peers are now in UI
             
-            # Process each discovered peer
-            for peer_id, (ip, port) in peers.items():
+            # Process each discovered peer: add if new, update if exists
+            for peer_id, (ip, port) in peers_from_discovery.items():
                 peer_text = f"{peer_id} ({ip}:{port})"
-                new_peers.add(peer_text)
+                discovered_peer_texts.add(peer_text)
                 
-                # Add peer if not already in list
-                if peer_text not in current_items:
+                if peer_text not in current_ui_peers:
+                    # New peer: add to UI list and schedule async check
                     try:
                         item = QListWidgetItem(peer_text)
                         try:
-                            item.setIcon(QIcon.fromTheme("network-wireless"))
+                            item.setIcon(QIcon.fromTheme("network-wireless")) # Attempt to set an icon
                         except Exception as icon_e:
                             logger.warning(f"Failed to set peer icon for {peer_text}: {icon_e}")
-                            pass  # Icon not available, continue without it
+                            pass
                         
-                        # Add peer immediately with gray color (will be updated in background)
-                        item.setForeground(Qt.gray)
+                        item.setForeground(Qt.gray) # Initially grey (offline/unknown)
                         self.peers_list.addItem(item)
-                        logger.info(f"Added new peer to list: {peer_text}")
-                        
-                        # Start background online check
-                        QTimer.singleShot(0, lambda p_text_str=peer_text, p_ip=ip, p_port=port: self._check_peer_online_async(p_text_str, p_ip, p_port))
+                        logger.info(f"Added new peer to list: {peer_text}. Initiating async check.")
+                        # Schedule check for next event loop iteration
+                        QTimer.singleShot(0, lambda p_text=peer_text, p_ip=ip, p_port=port: self._check_peer_online_async(p_text, p_ip, p_port))
                     except Exception as e:
-                        logger.error(f"Error adding peer {peer_text} to list: {str(e)}", exc_info=True)
+                        logger.error(f"Error adding peer {peer_text} to list: {e}", exc_info=True)
                         continue
+                else:
+                    # Existing peer: Ensure its status is checked if enough time has passed
+                    ip_port_str_key = f"{ip}:{port}" # Key for last_peer_check/peer_tokens
+                    last_check_time = self.last_peer_check.get(ip_port_str_key)
+                    if not last_check_time or (current_time - last_check_time).total_seconds() > self.peer_check_timeout / 2: # Re-check more often than token expiration
+                        if peer_text not in self.active_token_fetchers or not self.active_token_fetchers[peer_text].isRunning():
+                            logger.debug(f"Re-checking existing peer {peer_text} for online status/token.")
+                            QTimer.singleShot(0, lambda p_text=peer_text, p_ip=ip, p_port=port: self._check_peer_online_async(p_text, p_ip, p_port))
+
+            # Remove peers from UI that are no longer discovered
+            peers_to_remove_from_ui = [
+                peer_text for peer_text in current_ui_peers.keys() if peer_text not in discovered_peer_texts
+            ]
+            for peer_text in peers_to_remove_from_ui:
+                self._remove_peer(peer_text) # Use the unified removal method
             
-            # Remove peers that are no longer in discovery list
-            for i in range(self.peers_list.count() - 1, -1, -1):
-                item = self.peers_list.item(i)
-                if item and item.text() not in new_peers:
-                    peer_addr = item.text().split("(")[-1].strip(")")
-                    self.peers_list.takeItem(i)
-                    if peer_addr in self.peer_tokens:
-                        del self.peer_tokens[peer_addr]
-                    self.offline_peers.discard(item.text())
-                    logger.info(f"Removed peer from list: {item.text()}")
-            
-            # Log current state
-            logger.debug(f"Peer list updated. Current peers: {len(new_peers)}")
-            logger.debug(f"Offline peers: {list(self.offline_peers)}")
+            logger.debug(f"Peer list updated. Current UI peers count: {self.peers_list.count()}.")
+            logger.debug(f"Currently offline peers: {list(self.offline_peers)}")
             
         except Exception as e:
-            logger.critical(f"CRITICAL ERROR updating peer list: {str(e)}", exc_info=True)
+            logger.critical(f"CRITICAL ERROR updating peer list: {e}", exc_info=True)
             QTimer.singleShot(0, lambda: QMessageBox.warning(
                 self, "Peer Update Error",
-                "Failed to update peer list. Some peers may not be visible."
+                "Failed to update peer list. Some peers may not be visible due to an internal error."
             ))
 
-    def _check_peer_online_async(self, peer_text: str, ip: str, port: int): 
-        """Check peer online status in background and update UI, designed to be called asynchronously."""
-        logger.debug(f"Entering _check_peer_online_async for {peer_text}")
+    def _check_peer_online_async(self, peer_text: str, ip: str, port: int):
+        """
+        Launches a TokenFetcher thread to asynchronously check a peer's online status
+        and fetch its authentication token. Avoids duplicate concurrent checks.
+        """
+        logger.debug(f"Entering _check_peer_online_async for {peer_text}.")
         try:
-            # Ensure only one fetcher is active for a given peer_text
+            # Prevent launching multiple fetchers for the same peer simultaneously
             if peer_text in self.active_token_fetchers and self.active_token_fetchers[peer_text].isRunning():
-                logger.debug(f"Skipping _check_peer_online_async for {peer_text}: already active.")
+                logger.debug(f"Skipping _check_peer_online_async for {peer_text}: TokenFetcher already active.")
                 return
 
             fetcher = TokenFetcher(peer_text, ip, port, parent=self)
-            self.active_token_fetchers[peer_text] = fetcher
-            
-            # Connect signals to update UI
+            self.active_token_fetchers[peer_text] = fetcher # Store reference
+
+            # Connect signals
             fetcher.token_fetched.connect(self._handle_token_fetched)
             fetcher.peer_status_updated.connect(self._handle_peer_status_updated)
-            
-            fetcher.finished.connect(lambda: self._cleanup_token_fetcher(peer_text)) # Cleanup on finish
+            fetcher.finished.connect(lambda: self._cleanup_token_fetcher(peer_text)) # Cleanup when finished
             
             fetcher.start()
+            logger.debug(f"TokenFetcher started for {peer_text}.")
 
         except Exception as e:
-            logger.critical(f"CRITICAL ERROR in _check_peer_online_async for {peer_text}: {str(e)}", exc_info=True)
-            # Remove from active fetchers on error to allow retries
+            logger.critical(f"CRITICAL ERROR launching TokenFetcher for {peer_text}: {e}", exc_info=True)
+            # Ensure cleanup on critical error for this fetcher
             if peer_text in self.active_token_fetchers:
-                self.active_token_fetchers[peer_text].wait(100)
-                self.active_token_fetchers[peer_text].deleteLater()
-                del self.active_token_fetchers[peer_text]
+                fetcher = self.active_token_fetchers.pop(peer_text)
+                if fetcher.isRunning():
+                    fetcher.quit()
+                fetcher.wait(100)
+                fetcher.deleteLater()
 
     def _handle_token_fetched(self, peer_text: str, token: str | None):
-        """Callback for when a TokenFetcher thread finishes fetching a token."""
-        ip_port = peer_text.split("(")[-1].strip(")")
+        """
+        Callback triggered when a TokenFetcher thread successfully fetches a token
+        or fails to do so. Updates internal token cache and peer status.
+        """
+        ip_port_str = peer_text.split("(")[-1].strip(")")
         if token:
-            self.peer_tokens[ip_port] = token
-            self.last_peer_check[ip_port] = datetime.now()
-            self.peer_last_success[peer_text] = datetime.now() # Update last success for health check
-            self.peer_connection_attempts[peer_text] = 0 # Reset attempts
+            self.peer_tokens[ip_port_str] = token
+            self.last_peer_check[ip_port_str] = datetime.now()
+            self.peer_last_success[peer_text] = datetime.now() # Record last successful auth
+            self.peer_connection_attempts[peer_text] = 0 # Reset attempts on success
+            self.offline_peers.discard(peer_text) # Ensure removed from offline list
             logger.info(f"Token fetched and stored for {peer_text}.")
         else:
             logger.warning(f"Failed to fetch token for {peer_text}.")
-            # Token fetching failed, increment attempts
             self.peer_connection_attempts[peer_text] = self.peer_connection_attempts.get(peer_text, 0) + 1
-
+            self.offline_peers.add(peer_text) # Mark as offline if token fetch failed
 
     def _handle_peer_status_updated(self, peer_text: str, is_online: bool):
-        """Callback for when a TokenFetcher thread updates peer online status."""
+        """
+        Callback triggered when a TokenFetcher updates the online status of a peer.
+        Updates the UI to reflect the peer's status (color).
+        """
         items = self.peers_list.findItems(peer_text, Qt.MatchExactly)
         if items:
             item = items[0]
             if is_online:
-                item.setForeground(Qt.black)
+                item.setForeground(Qt.black) # Online peers are black
                 if peer_text in self.offline_peers:
                     self.offline_peers.discard(peer_text)
                     logger.info(f"Peer is back online: {peer_text}")
             else:
-                item.setForeground(Qt.gray)
+                item.setForeground(Qt.gray) # Offline peers are gray
                 if peer_text not in self.offline_peers:
                     self.offline_peers.add(peer_text)
                     logger.debug(f"Peer is offline: {peer_text}")
 
-
     def _cleanup_token_fetcher(self, peer_text: str):
-        """Removes a finished TokenFetcher from the active list."""
+        """Removes a finished TokenFetcher from the active list and cleans up its QObject."""
         fetcher = self.active_token_fetchers.pop(peer_text, None)
         if fetcher:
-            logger.debug(f"TokenFetcher for {peer_text} finished and cleaned up.")
-            fetcher.deleteLater() # Ensure proper QObject cleanup
+            logger.debug(f"TokenFetcher for {peer_text} finished and cleaned up from active list.")
+            fetcher.deleteLater() # Schedule QObject for proper deletion
 
+    def get_peer_token(self, ip: str, port: int) -> str | None:
+        """
+        Retrieves an authentication token for a given peer (IP:Port).
+        Uses a cached token if available and not expired.
+        Otherwise, attempts to synchronously fetch a new token, handling retries.
+        This method can block the UI if a synchronous fetch is needed.
+        """
+        peer_addr = f"{ip}:{port}"
+        # Construct peer_text for consistent keying in connection_attempts etc.
+        # This assumes peer_id can be derived or is not strictly needed here.
+        # For a precise peer_text, we'd need the device_id, which isn't passed here.
+        # However, for the purpose of health checks, peer_addr is sufficient as a key.
+        # A more robust solution might retrieve device_id from service_info or pass it.
+        # For now, let's just use ip:port as the unique part of the key.
+        peer_text_key = f"({peer_addr})" # Placeholder, ideally device_id should be included
 
-    def is_peer_online(self, ip: str, port: int) -> bool:
-        """Check if a peer is online with improved reliability (used by TokenFetcher)."""
+        # Try to find the full peer_text from the UI list for consistent keying
+        found_peer_text = None
+        for i in range(self.peers_list.count()):
+            item = self.peers_list.item(i)
+            if item and item.text().endswith(f"({peer_addr})"):
+                found_peer_text = item.text()
+                break
+        
+        if found_peer_text:
+            peer_text_key = found_peer_text # Use the full text if found
+
+        current_time = datetime.now()
+        
+        # 1. Check for valid cached token
+        if peer_addr in self.peer_tokens:
+            last_check = self.last_peer_check.get(peer_addr)
+            if last_check and (current_time - last_check).total_seconds() < self.peer_check_timeout:
+                logger.debug(f"Using cached token for {peer_text_key}.")
+                return self.peer_tokens[peer_addr]
+        
+        # 2. Check connection attempt limits for the peer
+        attempts = self.peer_connection_attempts.get(peer_text_key, 0)
+        last_success = self.peer_last_success.get(peer_text_key)
+        
+        if attempts >= self.max_connection_attempts:
+            # If past max attempts and not enough time passed since last success (or no success yet)
+            if not last_success or (current_time - last_success).total_seconds() < self.peer_retry_delay:
+                logger.warning(f"Too many failed token attempts for peer {peer_text_key}. Not attempting token fetch.")
+                QMessageBox.warning(
+                    self, "Connection Blocked",
+                    f"Too many failed connection attempts to {peer_text_key}. Please wait a moment before trying again."
+                )
+                return None
+            else:
+                # Enough time passed, reset attempts and try again synchronously
+                logger.info(f"Retry delay passed for {peer_text_key}. Resetting attempts and trying synchronous fetch.")
+                self.peer_connection_attempts[peer_text_key] = 0
+                attempts = 0 # Reset for current synchronous attempt
+
+        # 3. Perform a synchronous token fetch as a fallback or for initial request
+        session = requests.Session()
+        session.verify = False
+        retry_strategy = requests.adapters.Retry(
+            total=0, # No retries here, let the higher level logic handle retries via attempts counter
+            backoff_factor=0.1,
+            status_forcelist=[500, 502, 503, 504]
+        )
+        adapter = requests.adapters.HTTPAdapter(max_retries=retry_strategy)
+        session.mount("https://", adapter)
+        
         try:
-            session = requests.Session()
-            session.verify = False
-            timeout = (3, 5)
-            retry_strategy = requests.adapters.Retry(
-                total=2, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504]
+            logger.debug(f"Attempting synchronous token fetch for {peer_text_key}...")
+            r = session.post(
+                f"https://{ip}:{port}/auth",
+                json={"device_id": settings.device_id},
+                timeout=(5, 10) # Increased timeout for synchronous call
             )
-            adapter = requests.adapters.HTTPAdapter(max_retries=retry_strategy)
-            session.mount("https://", adapter)
+            r.raise_for_status() # Raise HTTPError for bad status codes
             
-            r = session.get(f"https://{ip}:{port}/ping", timeout=timeout, headers={"User-Agent": "P2PShare/1.0"})
+            token = r.json()["access_token"]
+            self.peer_tokens[peer_addr] = token
+            self.last_peer_check[peer_addr] = current_time
+            self.peer_last_success[peer_text_key] = current_time # Update last success
+            self.peer_connection_attempts[peer_text_key] = 0 # Reset attempts
+            self.offline_peers.discard(peer_text_key) # Ensure peer is marked online
             
-            if r.ok:
-                try:
-                    data = r.json()
-                    if data.get("status") == "online":
-                        logger.debug(f"Peer {ip}:{port} is online")
-                        return True
-                except ValueError:
-                    logger.debug(f"Peer {ip}:{port} returned invalid JSON")
-                    return False
-                    
-            logger.debug(f"Peer {ip}:{port} returned status {r.status_code}")
-            return False
+            logger.debug(f"Successfully obtained token for {peer_text_key} (synchronously).")
+            return token
             
-        except requests.exceptions.SSLError as e:
-            logger.debug(f"SSL error checking peer {ip}:{port}: {str(e)}")
-            return True  # Consider SSL errors as "online" since the server is responding
+        except requests.exceptions.HTTPError as e:
+            self.peer_connection_attempts[peer_text_key] = attempts + 1 # Increment on HTTP error
+            logger.warning(f"Synchronous HTTP error getting token from {peer_text_key}: {e}")
+            QMessageBox.warning(
+                self, "Authentication Error",
+                f"Server returned an error from {peer_text_key}: {e.response.status_code}. Details: {e.response.text}"
+            )
+            return None
             
-        except requests.exceptions.ConnectionError as e:
-            logger.debug(f"Connection error checking peer {ip}:{port}: {str(e)}")
-            return False
-            
-        except requests.exceptions.Timeout:
-            logger.debug(f"Timeout checking peer {ip}:{port}")
-            return False
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            self.peer_connection_attempts[peer_text_key] = attempts + 1 # Increment on network error
+            logger.warning(f"Synchronous network error getting token from {peer_text_key}: {e}")
+            self.offline_peers.add(peer_text_key) # Mark as offline
+            QMessageBox.warning(
+                self, "Connection Error",
+                f"Could not connect to {peer_text_key}. The peer may be offline or unreachable."
+            )
+            return None
             
         except Exception as e:
-            logger.error(f"Error checking peer {ip}:{port}: {str(e)}", exc_info=True)
-            return False
+            logger.error(f"Unexpected error in get_peer_token for {peer_text_key}: {e}", exc_info=True)
+            self.peer_connection_attempts[peer_text_key] = attempts + 1 # Increment on any unexpected error
+            QMessageBox.warning(
+                self, "Authentication Error",
+                f"An unexpected error occurred during token retrieval from {peer_text_key}: {e}"
+            )
+            return None
             
         finally:
             session.close()
-
-    def get_peer_token(self, ip: str, port: int) -> str:
-        """Get or refresh token for a peer with improved reliability"""
-        peer_addr = f"{ip}:{port}"
-        # Reconstruct peer_text to match the key used in peer_connection_attempts and peer_last_success
-        peer_text = f"{settings.device_id} ({peer_addr})" 
-        current_time = datetime.now()
-        
-        try:
-            # Check if we have a valid cached token
-            if peer_addr in self.peer_tokens:
-                last_check = self.last_peer_check.get(peer_addr)
-                if last_check and (current_time - last_check).total_seconds() < self.peer_check_timeout:
-                    logger.debug(f"Using cached token for {peer_text}.")
-                    return self.peer_tokens[peer_addr]
-            
-            # Check connection attempts
-            attempts = self.peer_connection_attempts.get(peer_text, 0) # Use peer_text for attempts
-            if attempts >= self.max_connection_attempts:
-                last_success = self.peer_last_success.get(peer_text) # Use peer_text for last_success
-                if not last_success or (current_time - last_success).total_seconds() < self.peer_retry_delay:
-                    logger.warning(f"Too many failed attempts for peer {peer_text}. Not attempting token fetch.")
-                    QMessageBox.warning(
-                        self, "Connection Error",
-                        f"Too many failed connection attempts to {peer_text}. Please try again later."
-                    )
-                    return None
-            
-            # --- Fallback to synchronous check if TokenFetcher hasn't provided info recently ---
-            # This synchronous block should ideally be less frequent, relying more on async fetchers.
-            # However, for direct action (e.g., browse/download click), a synchronous attempt is okay.
-
-            # Try to get a new token with retry logic
-            session = requests.Session()
-            session.verify = False
-            
-            retry_strategy = requests.adapters.Retry(
-                total=2,
-                backoff_factor=0.5,
-                status_forcelist=[500, 502, 503, 504]
-            )
-            adapter = requests.adapters.HTTPAdapter(max_retries=retry_strategy)
-            session.mount("https://", adapter)
-            
-            try:
-                logger.debug(f"Attempting synchronous token fetch for {peer_text}...")
-                r = session.post(
-                    f"https://{ip}:{port}/auth",
-                    json={"device_id": settings.device_id},
-                    timeout=(3, 5)
-                )
-                r.raise_for_status()
-                
-                token = r.json()["token"]
-                self.peer_tokens[peer_addr] = token
-                self.last_peer_check[peer_addr] = current_time
-                self.peer_last_success[peer_text] = current_time # Use peer_text for last_success
-                self.peer_connection_attempts[peer_text] = 0 # Reset attempts
-                self.offline_peers.discard(peer_text)
-                
-                logger.debug(f"Successfully obtained token for {peer_text} (synchronously).")
-                return token
-                
-            except requests.exceptions.HTTPError as e:
-                self.peer_connection_attempts[peer_text] = attempts + 1 # Increment attempts
-                logger.warning(f"Synchronous HTTP error getting token from {peer_text}: {str(e)}")
-                QMessageBox.warning(
-                    self, "Authentication Error",
-                    f"Server returned an error: {e.response.status_code}"
-                )
-                return None
-                
-            except requests.exceptions.Timeout:
-                self.peer_connection_attempts[peer_text] = attempts + 1 # Increment attempts
-                logger.warning(f"Synchronous Timeout getting token from {peer_text}")
-                QMessageBox.warning(
-                    self, "Connection Timeout",
-                    f"Connection to {peer_text} timed out. Please try again."
-                )
-                return None
-                
-            except requests.exceptions.ConnectionError:
-                self.peer_connection_attempts[peer_text] = attempts + 1 # Increment attempts
-                logger.warning(f"Synchronous Connection error getting token from {peer_text}")
-                self.offline_peers.add(peer_text)
-                QMessageBox.warning(
-                    self, "Connection Error",
-                    f"Could not connect to {peer_text}. The peer may be offline."
-                )
-                return None
-                
-            finally:
-                session.close()
-                
-        except Exception as e:
-            logger.error(f"Error in get_peer_token for {peer_text}: {str(e)}", exc_info=True)
-            QMessageBox.warning(
-                self, "Authentication Error",
-                f"An unexpected error occurred during token retrieval: {str(e)}"
-            )
-            return None
 
     def handle_download_error(self, error_message):
         """Handle download errors with improved user feedback"""
@@ -2212,7 +1324,7 @@ class MainWindow(QWidget):
                         self.current_download.stop()
                     self.current_download.deleteLater()
                 except Exception as e:
-                    logger.error(f"Error cleaning up download process: {str(e)}")
+                    logger.error(f"Error cleaning up download process: {e}")
                 finally:
                     self.current_download = None
 
@@ -2220,124 +1332,145 @@ class MainWindow(QWidget):
                 try:
                     self.current_progress.close()
                 except Exception as e:
-                    logger.error(f"Error closing progress dialog: {str(e)}")
+                    logger.error(f"Error closing progress dialog: {e}")
                 finally:
                     self.current_progress = None
 
             self.is_operation_cancelled = False
         except Exception as e:
-            logger.error(f"Error in worker cleanup: {str(e)}")
+            logger.error(f"Error in worker cleanup: {e}")
 
     def _check_peer_health(self):
         """Periodically check health of connected peers"""
-        logger.debug("Running peer health check.")
-        try:
-            current_time = datetime.now()
-            peers_to_remove = set()
-            
-            # Iterate over a copy of keys to allow modification during iteration
-            for peer_text_key in list(self.peer_connection_attempts.keys()): 
-                try:
-                    # peer_text_key is already in the format "deviceA (IP:PORT)"
-                    parts = peer_text_key.split('(')
-                    if len(parts) < 2: # Skip malformed keys
-                        logger.warning(f"Malformed peer_text_key in peer_connection_attempts: {peer_text_key}. Removing.")
-                        peers_to_remove.add(peer_text_key)
-                        continue
-
-                    ip_port = parts[-1].strip(")")
-                    if ':' not in ip_port: # Ensure it's a valid IP:PORT format
-                        logger.warning(f"Malformed IP:PORT in peer_text_key: {ip_port}. Removing.")
-                        peers_to_remove.add(peer_text_key)
-                        continue
-                    
-                    ip, port_str = ip_port.split(":")
-                    port = int(port_str)
-                    
-                    attempts = self.peer_connection_attempts.get(peer_text_key, 0)
-                    last_success = self.peer_last_success.get(peer_text_key)
-                    
-                    if attempts >= self.max_connection_attempts:
-                        if last_success and (current_time - last_success).total_seconds() < self.peer_retry_delay:
-                            continue # Still within retry delay, skip
-                        # Reset attempts if enough time has passed to retry
-                        self.peer_connection_attempts[peer_text_key] = 0
-                        attempts = 0 # Reset for current check
-
-                    # Trigger a new asynchronous check for online status and token
-                    # Use the peer_text_key (string) consistently
-                    self._check_peer_online_async(peer_text_key, ip, port)
-                            
-                except Exception as e:
-                    logger.error(f"Error processing peer {peer_text_key} in health check: {str(e)}", exc_info=True)
+        logger.debug("Running periodic peer health check.")
+        current_time = datetime.now()
+        
+        # Get a copy of the peer_connection_attempts keys as it might be modified
+        for peer_text_key in list(self.peer_connection_attempts.keys()):
+            try:
+                # Ensure peer_text_key is associated with an item in the list
+                items = self.peers_list.findItems(peer_text_key, Qt.MatchExactly)
+                if not items:
+                    logger.debug(f"Peer '{peer_text_key}' not found in UI list during health check. Removing from tracking.")
+                    self._remove_peer_tracking_data(peer_text_key)
                     continue
-            
-            # Remove failed peers (from outside the loop)
-            for peer_text in peers_to_remove:
-                self._remove_peer(peer_text)
+
+                # Parse IP and Port from peer_text_key (e.g., "deviceA (IP:PORT)")
+                # This logic should match how peer_text_key is formed in update_peer_list and _handle_token_fetched
+                parts = peer_text_key.split('(')
+                if len(parts) < 2 or ':' not in parts[-1].strip(')'):
+                    logger.warning(f"Malformed peer_text_key '{peer_text_key}' during health check. Skipping.")
+                    self._remove_peer_tracking_data(peer_text_key) # Remove malformed entry
+                    continue
                 
-        except Exception as e:
-            logger.error(f"Error in peer health check: {str(e)}", exc_info=True)
+                ip_port_str = parts[-1].strip(')')
+                ip, port_str = ip_port_str.split(":")
+                port = int(port_str)
+                
+                attempts = self.peer_connection_attempts.get(peer_text_key, 0)
+                last_success = self.peer_last_success.get(peer_text_key)
+                
+                # Logic for re-attempting token fetch for potentially offline/unresponsive peers
+                if (peer_text_key in self.offline_peers or # If explicitly marked offline
+                    (last_success and (current_time - last_success).total_seconds() > self.peer_check_timeout) or # Token expired
+                    (attempts > 0 and (not last_success or (current_time - last_success).total_seconds() > self.peer_retry_delay))): # Failed attempts, retry delay passed
+                    
+                    if peer_text_key not in self.active_token_fetchers or not self.active_token_fetchers[peer_text_key].isRunning():
+                        logger.info(f"Triggering async re-check for peer health/token for {peer_text_key}.")
+                        self._check_peer_online_async(peer_text_key, ip, port)
+                    else:
+                        logger.debug(f"TokenFetcher already active for {peer_text_key}, skipping re-trigger.")
+                
+            except Exception as e:
+                logger.error(f"Error processing peer {peer_text_key} in health check: {e}", exc_info=True)
+                # If an error occurs here, it might be due to a corrupted entry, so remove it.
+                self._remove_peer_tracking_data(peer_text_key)
 
-    def _remove_peer(self, peer_text):
-        """Safely remove a peer from all tracking structures"""
-        try:
-            logger.info(f"Attempting to remove peer: {peer_text}")
-            # Remove from UI
-            items = self.peers_list.findItems(peer_text, Qt.MatchExactly)
-            if items:
-                self.peers_list.takeItem(self.peers_list.row(items[0]))
-                logger.debug(f"Removed {peer_text} from peers_list UI.")
+    def _remove_peer(self, peer_text: str):
+        """
+        Safely removes a peer's entry from the UI list and all internal tracking dictionaries.
+        This is typically called when a peer is no longer discovered by Zeroconf.
+        """
+        logger.info(f"Attempting to remove peer: {peer_text}.")
+        
+        # Remove from UI list
+        items = self.peers_list.findItems(peer_text, Qt.MatchExactly)
+        if items:
+            row = self.peers_list.row(items[0])
+            self.peers_list.takeItem(row)
+            logger.debug(f"Removed '{peer_text}' from peers_list UI.")
+        else:
+            logger.debug(f"Peer '{peer_text}' not found in UI list during removal attempt.")
+
+        # Remove from all internal tracking data structures
+        self._remove_peer_tracking_data(peer_text)
+        logger.info(f"Successfully removed peer: {peer_text}.")
             
-            # Remove from tracking structures
-            ip_port = peer_text.split("(")[-1].strip(")")
-            if ip_port in self.peer_tokens:
-                del self.peer_tokens[ip_port]
-                logger.debug(f"Removed {ip_port} from peer_tokens.")
-            if ip_port in self.last_peer_check:
-                del self.last_peer_check[ip_port]
-                logger.debug(f"Removed {ip_port} from last_peer_check.")
+    def _remove_peer_tracking_data(self, peer_text_key: str):
+        """Helper to remove peer from all relevant tracking dictionaries."""
+        ip_port_str = peer_text_key.split("(")[-1].strip(")") # Extract IP:PORT part
+        
+        if ip_port_str in self.peer_tokens:
+            del self.peer_tokens[ip_port_str]
+            logger.debug(f"Removed '{ip_port_str}' from peer_tokens.")
+        if ip_port_str in self.last_peer_check:
+            del self.last_peer_check[ip_port_str]
+            logger.debug(f"Removed '{ip_port_str}' from last_peer_check.")
+        
+        # These use the full peer_text as key
+        if peer_text_key in self.peer_connection_attempts:
+            del self.peer_connection_attempts[peer_text_key]
+            logger.debug(f"Removed '{peer_text_key}' from peer_connection_attempts.")
+        if peer_text_key in self.peer_last_success:
+            del self.peer_last_success[peer_text_key]
+            logger.debug(f"Removed '{peer_text_key}' from peer_last_success.")
+        if peer_text_key in self.offline_peers:
+            self.offline_peers.discard(peer_text_key) # Use discard as it won't raise error if not present
+            logger.debug(f"Removed '{peer_text_key}' from offline_peers set.")
+        
+        # Clean up any active TokenFetcher for this peer
+        if peer_text_key in self.active_token_fetchers:
+            fetcher = self.active_token_fetchers.pop(peer_text_key)
+            if fetcher.isRunning():
+                fetcher.quit()
+                fetcher.wait(1000) # Give time for thread to exit
+            fetcher.deleteLater() # Schedule QObject for deletion
+            logger.debug(f"Removed and cleaned up TokenFetcher for '{peer_text_key}'.")
 
-            # These use the full peer_text
-            if peer_text in self.peer_connection_attempts:
-                del self.peer_connection_attempts[peer_text]
-                logger.debug(f"Removed {peer_text} from peer_connection_attempts.")
-            if peer_text in self.peer_last_success:
-                del self.peer_last_success[peer_text]
-                logger.debug(f"Removed {peer_text} from peer_last_success.")
-            if peer_text in self.offline_peers:
-                self.offline_peers.discard(peer_text) # Use discard as it won't raise error if not present
-                logger.debug(f"Removed {peer_text} from offline_peers set.")
-            if peer_text in self.active_token_fetchers:
-                fetcher = self.active_token_fetchers.pop(peer_text)
-                if fetcher.isRunning():
-                    fetcher.quit()
-                    fetcher.wait(1000)
-                fetcher.deleteLater()
-                logger.debug(f"Removed and cleaned up TokenFetcher for {peer_text}.")
-            
-            logger.info(f"Successfully removed peer: {peer_text}")
-            
-        except Exception as e:
-            logger.error(f"Error removing peer {peer_text}: {str(e)}", exc_info=True)
 
-
-def run(app_instance=None): # Added app_instance parameter
+def run(app_instance=None):
+    """
+    Entry point for running the P2PShare GUI application.
+    Initializes QApplication and displays the MainWindow.
+    """
     logger.info("Starting P2PShare application (run function called)")
-    if app_instance is None: # Only create QApplication if not passed
+    if app_instance is None:
         app = QApplication(sys.argv)
         logger.info("QApplication instance created in run().")
     else:
         app = app_instance
         logger.info("Using existing QApplication instance in run().")
 
-    win = MainWindow()
+    # Initialize the security manager here if not already done in main.py
+    # This assumes CONFIG_DIR is properly set up and accessible.
+    global security_manager
+    if not security_manager.is_initialized():
+        # Attempt to load security on startup. If it fails, the user will be prompted.
+        # This initial load doesn't show a dialog directly, that's handled in main.py's flow.
+        try:
+            security_manager.load_security(None) # Attempt to load without password, or mark as uninitialized
+            if not security_manager.is_initialized():
+                 logger.info("Security manager not initialized on startup, will prompt user.")
+            else:
+                 logger.info("Security manager loaded successfully on startup.")
+        except Exception as e:
+            logger.error(f"Error initializing security manager in GUI: {e}")
+
+    win = MainWindow(security_manager)
     win.show()
     logger.info("Main window displayed from run().")
     
-    # Do not call sys.exit(app.exec_()) here as main.py is already doing it.
-    # This function is meant to be called by main.py after QApplication is ready.
-    # If this `run` function is called directly for testing, it would block.
-    # For now, this is just called by main.py, so it just creates and shows the window.
-    # The app.exec_() will be in main.py.
-    pass
+    # Do NOT call app.exec_() here if this function is intended to be called
+    # by an external script (like main.py) that manages the event loop.
+    # The main script (e.g., main.py) should be responsible for app.exec_().
+    # pass

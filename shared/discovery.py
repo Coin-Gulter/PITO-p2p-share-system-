@@ -1,448 +1,324 @@
-# p2pshare/shared/discovery.py
-
-from zeroconf import ServiceInfo, Zeroconf, ServiceBrowser, ServiceStateChange
-from threading import Thread, Lock, Event
 import socket
 import time
-import netifaces
-from shared.config import settings
-from shared.logging_config import setup_logger
+import json
+import logging
+import asyncio
+import threading
+import uuid # For generating unique device IDs
+
+from zeroconf import ServiceInfo, ServiceBrowser, Zeroconf, ServiceStateChange
+from typing import Dict, Tuple
 
 # Set up logger
-logger = setup_logger(__name__)
+logger = logging.getLogger(__name__)
+# Configure logging for better visibility during testing
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
+# Constants
 SERVICE_TYPE = "_p2pshare._tcp.local."
-# Add instance-specific service name to avoid conflicts on same machine
-SERVICE_NAME = f"{settings.device_id}-{socket.gethostname()}.{SERVICE_TYPE}"
-
-def get_network_interfaces():
-    """Get all available network interfaces that are up and have an IP address"""
-    interfaces = []
-    try:
-        # First try to get all interfaces
-        for iface in netifaces.interfaces():
-            addrs = netifaces.ifaddresses(iface)
-            if netifaces.AF_INET in addrs:  # Has IPv4 address
-                for addr in addrs[netifaces.AF_INET]:
-                    if 'addr' in addr and not addr['addr'].startswith('127.'):
-                        interfaces.append((iface, addr['addr']))
-                        logger.debug(f"Found interface {iface} with address {addr['addr']}")
-        
-        # If no interfaces found, try localhost
-        if not interfaces:
-            interfaces.append(('lo', '127.0.0.1'))
-            logger.debug("No external interfaces found, using localhost")
-            
-        return interfaces
-    except Exception as e:
-        logger.error(f"Error getting network interfaces: {str(e)}", exc_info=True)
-        # Fallback to localhost
-        return [('lo', '127.0.0.1')]
-
-def get_local_ip():
-    """Get the best local IP address for service discovery"""
-    try:
-        # First try to get all interfaces
-        interfaces = get_network_interfaces()
-        if interfaces:
-            # Prefer non-loopback interfaces
-            for iface, addr in interfaces:
-                if not addr.startswith('127.'):
-                    logger.info(f"Using interface {iface} with address {addr}")
-                    return addr
-            
-            # Fallback to first interface if all are loopback
-            return interfaces[0][1]
-            
-        # Fallback to old method if no interfaces found
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            # Try to connect to a public DNS server
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            logger.info(f"Using fallback IP address: {ip}")
-            return ip
-        except Exception:
-            # If that fails, use localhost
-            logger.warning("Could not determine external IP, using localhost")
-            return "127.0.0.1"
-        finally:
-            s.close()
-    except Exception as e:
-        logger.warning(f"Failed to get local IP: {str(e)}", exc_info=True)
-        return "127.0.0.1"
+# TTL_SECONDS = 60 * 5 # 5 minutes # Retained for clarity, but not passed to ServiceInfo init
 
 class PeerDiscovery:
-    def __init__(self, port: int):
-        self.zeroconf = None  # Initialize as None
+    def __init__(self, port: int, device_id: str): # Added device_id to init
         self.port = port
-        self.peers = {}  # {device_id: (ip, port)}
-        self.browser = None
-        self._peers_lock = Lock()
-        self._stop_event = Event()
-        self._service_info = None  # Store our service info
-        self._known_services = set()  # Track known services
-        self._loop = None  # Store event loop
-        # Create unique instance ID for this discovery instance
-        self._instance_id = f"{settings.device_id}-{port}"
-        logger.info(f"Initialized PeerDiscovery on port {port} with instance ID {self._instance_id}")
+        self.device_id = device_id
+        # Unique instance name per run, incorporating device_id and port for clarity
+        self.instance_name = f"{device_id}-{port}-{int(time.time())}"
+        self.peers: Dict[str, Tuple[str, int]] = {} # {device_id: (ip, port)}
+        self.service_info: ServiceInfo | None = None
+        self.zeroconf_instance: Zeroconf | None = None
+        self.browser: ServiceBrowser | None = None
+        self._is_running = False
+        self._browser_task = None
+        self._loop = None # Stores the asyncio event loop for this instance
 
-    def get_peers(self):
-        """Get current peers with a refresh of the service list"""
+        logger.info(f"Initialized PeerDiscovery on port {self.port} with instance ID {self.instance_name}")
+
+    def _get_local_ip(self):
+        """Attempts to get the local IP address."""
         try:
-            # Only attempt refresh if zeroconf is active
-            if self.zeroconf and not self._stop_event.is_set() and self._service_info:
-                try:
-                    services = self.zeroconf.get_service_info(SERVICE_TYPE, self._service_info.name)
-                    if services:
-                        self._process_added_service_info(SERVICE_TYPE, self._service_info.name, self.zeroconf)
-                except Exception as e:
-                    logger.debug(f"Error refreshing service list: {e}")
-        except Exception as e:
-            logger.debug(f"Error in get_peers: {e}")
-            
-        with self._peers_lock:
-            return dict(self.peers)
-
-    def register_service(self):
-        """Register the service with improved reliability"""
-        try:
-            if self.zeroconf is None:
-                self.zeroconf = Zeroconf()
-                self._loop = self.zeroconf.loop
-
-            # Get current IP
-            ip = get_local_ip()
-            if ip == "127.0.0.1":
-                logger.warning("Using loopback address - discovery may be limited to local machine")
-
-            # Create unique service name for this instance with timestamp to avoid conflicts
-            timestamp = int(time.time())
-            service_name = f"{self._instance_id}-{timestamp}.{SERVICE_TYPE}"
-            
-            logger.info(f"Registering service: {service_name} on {ip}:{self.port}")
-            
-            # Create service info with minimal properties
-            self._service_info = ServiceInfo(
-                SERVICE_TYPE,
-                service_name,
-                addresses=[socket.inet_aton(ip)],
-                port=self.port,
-                properties={
-                    "id": settings.device_id.encode(),
-                    "instance_id": self._instance_id.encode(),
-                    "port": str(self.port).encode(),
-                    "hostname": socket.gethostname().encode(),
-                    "timestamp": str(timestamp).encode()  # Add timestamp for freshness
-                },
-            )
-            
-            # Register service with retry and proper cleanup
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    if not self._stop_event.is_set():
-                        # Unregister any existing service first
-                        if self._service_info:
-                            try:
-                                self.zeroconf.unregister_service(self._service_info)
-                            except Exception as e:
-                                logger.debug(f"Error unregistering existing service: {e}")
-                        
-                        # Wait a moment before registering new service
-                        time.sleep(0.5)
-                        
-                        self.zeroconf.register_service(self._service_info)
-                        logger.info(f"Service registered successfully: {service_name}")
-                        return True
-                except Exception as e:
-                    if attempt < max_retries - 1:
-                        logger.warning(f"Registration attempt {attempt + 1} failed: {e}, retrying...")
-                        time.sleep(1)  # Wait before retry
-                    else:
-                        raise
-            
-        except Exception as e:
-            logger.error(f"Error registering service: {str(e)}", exc_info=True)
-            # Clean up zeroconf on registration failure
-            if self.zeroconf:
-                try:
-                    self.zeroconf.close()
-                except Exception as cleanup_error:
-                    logger.debug(f"Error during zeroconf cleanup: {cleanup_error}")
-                self.zeroconf = None
-                self._loop = None
-            return False
-
-    def browse(self):
-        """Start browsing for services with improved reliability"""
-        if self._stop_event.is_set():
-            logger.warning("Cannot start browsing - service is stopping")
-            return False
-
-        logger.info(f"Starting to browse for services of type: {SERVICE_TYPE}")
-        
-        try:
-            # Cancel existing browser if any
-            if self.browser:
-                try:
-                    self.browser.cancel()
-                    # Wait a short time for the browser to fully cancel
-                    time.sleep(0.1)
-                except Exception as e:
-                    logger.debug(f"Error canceling existing browser: {e}")
-                finally:
-                    self.browser = None
-            
-            # Clear known services
-            self._known_services.clear()
-            
-            # Create a handler function that matches the expected signature
-            def on_service_state_change(zeroconf, service_type, name, state_change):
-                if not self._stop_event.is_set():
-                    self._on_service_state_change(zeroconf, service_type, name, state_change)
-            
-            # Start new browser with the wrapped handler
-            self.browser = ServiceBrowser(
-                self.zeroconf,
-                SERVICE_TYPE,
-                handlers=[on_service_state_change]
-            )
-            logger.info("Service browser started")
-            
-            # Force an immediate browse of all services
+            # Create a socket connection to an external server (e.g., Google's DNS)
+            # This doesn't actually send data, just finds the local IP used for external connections.
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80)) # Connect to a public DNS server
+            local_ip = s.getsockname()[0]
+            s.close()
+            return local_ip
+        except Exception:
             try:
-                # Use get_service_info instead of get_service_info_list
-                services = self.zeroconf.get_service_info(SERVICE_TYPE, self._service_info.name)
-                if services:
-                    self._process_added_service_info(SERVICE_TYPE, self._service_info.name, self.zeroconf)
+                # Fallback to hostname if direct connection fails
+                return socket.gethostbyname(socket.gethostname())
             except Exception as e:
-                logger.debug(f"Error during initial service browse: {e}")
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error starting service browser: {e}", exc_info=True)
-            return False
+                logger.error(f"Could not determine local IP address: {e}")
+                return "127.0.0.1" # Fallback to loopback if all else fails
 
-    def _process_added_service_info(self, service_type: str, name: str, zeroconf_instance: Zeroconf):
-        """Process a newly added service with improved reliability"""
+    def _on_service_state_change(self, zeroconf: Zeroconf, service_type: str, name: str, state_change: ServiceStateChange):
+        """Callback for Zeroconf service state changes."""
+        logger.info(f"Service state change detected: {name} - {state_change.name}") # Log all state changes at INFO level
+
+        if state_change == ServiceStateChange.Added:
+            # Crucially, use call_soon_threadsafe to schedule the coroutine onto this instance's event loop.
+            # This ensures it runs safely even if the event is triggered immediately after loop setup
+            # or from a different thread context (e.g., Zeroconf's internal threads).
+            if self._loop and not self._loop.is_closed(): # Ensure loop is available and not closed
+                # Schedule a coroutine as a task on the event loop
+                self._loop.call_soon_threadsafe(
+                    lambda: asyncio.ensure_future(
+                        self._async_request_service_info(zeroconf, service_type, name),
+                        loop=self._loop
+                    )
+                )
+                logger.debug(f"Scheduled async request for service info for {name} using call_soon_threadsafe.")
+            else:
+                logger.error(f"Cannot schedule _async_request_service_info for {name}: event loop is not available or closed.")
+
+        elif state_change == ServiceStateChange.Removed:
+            # Remove peer from list if service is removed
+            try:
+                instance_name_part = name.split(SERVICE_TYPE)[0].strip('.')
+                name_parts = instance_name_part.split('-')
+                removed_device_id = '-'.join(name_parts[:-2])
+                removed_port = int(name_parts[-2]) # Ensure correct parsing of port
+
+                # Check if the peer to be removed actually exists and matches port
+                if removed_device_id in self.peers and self.peers[removed_device_id][1] == removed_port:
+                    del self.peers[removed_device_id]
+                    logger.info(f"Removed peer {removed_device_id} (port {removed_port}) due to service removal. Current peers: {self.peers}")
+                else:
+                    logger.debug(f"Removed service {name} did not match an active peer or was an older instance (device_id: {removed_device_id}, port: {removed_port}).")
+            except Exception as e:
+                logger.warning(f"Could not parse removed service name {name}: {e}")
+
+    async def _async_request_service_info(self, zeroconf: Zeroconf, service_type: str, name: str):
+        """Asynchronously requests and processes service information."""
+        logger.info(f"Requesting service info for: {name}")
         try:
-            info = zeroconf_instance.get_service_info(service_type, name)
-            if not info:
-                logger.debug(f"No service info found for {name}")
-                return
-
-            # Get basic service properties
-            device_id = info.properties.get(b"id", b"").decode()
-            instance_id = info.properties.get(b"instance_id", b"").decode()
-            port_str = info.properties.get(b"port", b"").decode()
-            hostname = info.properties.get(b"hostname", b"").decode()
-            timestamp = int(info.properties.get(b"timestamp", b"0").decode())
-            
-            # Skip if this is our own instance
-            if instance_id == self._instance_id:
-                logger.debug(f"Ignoring self instance: {instance_id}")
-                return
+            info = await zeroconf.async_get_service_info(service_type, name)
+            if info:
+                addresses = [
+                    socket.inet_ntoa(addr) for addr in info.addresses
+                ]
+                port = info.port
                 
-            parsed_addresses = info.parsed_addresses()
-            if not parsed_addresses:
-                logger.warning(f"No addresses found for service {name}")
-                return
-                
-            ip = parsed_addresses[0]
-            port = int(port_str) if port_str else info.port
-            
-            if device_id:
-                # Check if service is fresh (within last 60 seconds)
-                if time.time() - timestamp > 60:
-                    logger.debug(f"Ignoring stale service: {device_id} (timestamp: {timestamp})")
-                    return
-                    
-                logger.info(f"Found new peer: {device_id} at {ip}:{port} (instance: {instance_id})")
-                with self._peers_lock:
-                    self.peers[device_id] = (ip, port)
-                    self._known_services.add(name)
-                    logger.debug(f"Updated peers dict: {self.peers}")
-                
-        except Exception as e:
-            logger.error(f"Error processing service info: {str(e)}", exc_info=True)
-
-    def _on_service_state_change(self, zeroconf_instance: Zeroconf, service_type: str, name: str, state_change: ServiceStateChange):
-        """Handle service state changes with improved reliability"""
-        if self._stop_event.is_set():
-            return
-
-        logger.debug(f"Service state change: {name} - {state_change}")
-        
-        try:
-            if state_change == ServiceStateChange.Removed:
+                # Extract device_id from the instance name (e.g., "deviceA-5000-timestamp")
+                # Assumes the instance name format is "device_id-port-timestamp"
                 try:
-                    # Extract device ID from service name
-                    device_id = name.split('.')[0]  # Handle new name format
-                    with self._peers_lock:
-                        if device_id in self.peers:
-                            logger.info(f"Peer removed: {device_id}")
-                            del self.peers[device_id]
-                            self._known_services.discard(name)
-                            logger.debug(f"Updated peers dict after removal: {self.peers}")
+                    name_parts = name.split(SERVICE_TYPE)[0].split('-')
+                    discovered_device_id = '-'.join(name_parts[:-2])
+                    discovered_port = int(name_parts[-2])
+                    # Ensure the timestamp is parsed correctly by stripping any trailing dot
+                    # This handles cases like '12345.'
+                    discovered_timestamp = int(name_parts[-1].strip('.'))
                 except Exception as e:
-                    logger.error(f"Error processing service removal: {str(e)}", exc_info=True)
-            
-            elif state_change == ServiceStateChange.Added:
-                self._process_added_service_info(service_type, name, zeroconf_instance)
-                
-            elif state_change == ServiceStateChange.Updated:
-                # Handle service updates (e.g., new timestamp)
-                self._process_added_service_info(service_type, name, zeroconf_instance)
+                    logger.warning(f"Could not parse device_id or port from service name {name}: {e}. Skipping processing.")
+                    return # Skip this service if name format is unexpected
+
+                # Ignore self-instance if discovered (crucial to avoid adding self as a peer)
+                if discovered_device_id == self.device_id and discovered_port == self.port:
+                    logger.debug(f"Ignoring self instance: {discovered_device_id}-{discovered_port} (Matches self's device_id and port).")
+                    return
+
+                # Choose the first available address (assuming IPv4 for simplicity)
+                if addresses:
+                    ip = addresses[0]
+                    peer_key = discovered_device_id 
+                    
+                    # For simplicity, if a peer with this device_id already exists,
+                    # we will overwrite it with the newly discovered info.
+                    if peer_key in self.peers:
+                        logger.debug(f"Overwriting existing peer data for {peer_key}. Old: {self.peers[peer_key]}, New: ({ip}, {port})")
+
+                    self.peers[peer_key] = (ip, port)
+                    logger.info(f"Found new peer: {discovered_device_id} at {ip}:{port} (instance: {name.split(SERVICE_TYPE)[0]}). Added to peers list.")
+                    logger.debug(f"Current peers dict: {self.peers}")
+                else:
+                    logger.warning(f"No valid IP addresses found for service {name}.")
+            else:
+                logger.warning(f"No service info returned for {name}.")
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout while requesting service info for {name}. Peer might be unresponsive or network slow.")
         except Exception as e:
-            logger.error(f"Error in service state change handler: {str(e)}", exc_info=True)
+            logger.error(f"Error processing service info for {name}: {e}", exc_info=True)
+
 
     def run(self):
-        """Run the discovery service with improved reliability"""
-        logger.info(f"Starting discovery service with device_id: {settings.device_id}")
-        
-        try:
-            # Initialize Zeroconf if not already done
-            if self.zeroconf is None:
-                self.zeroconf = Zeroconf()
-                self._loop = self.zeroconf.loop
+        """Starts the Zeroconf discovery service. This method blocks until unregister is called."""
+        if self._is_running:
+            logger.warning("Discovery service is already running.")
+            return
 
-            # Register and browse
-            if not self.register_service():
-                logger.error("Failed to register service")
-                return
-                
-            # Small delay to ensure registration is complete
-            time.sleep(1)
-                
-            if not self.browse():
-                logger.error("Failed to start service browser")
-                return
-                
-            logger.info("Discovery service started")
-            
-            # Run loop with periodic re-registration and cleanup
-            last_register_time = time.time()
-            last_cleanup_time = time.time()
-            registration_failures = 0
-            max_failures = 3
-            
-            while not self._stop_event.is_set():
-                try:
-                    current_time = time.time()
-                    
-                    # Re-register service every 30 seconds to maintain presence
-                    if current_time - last_register_time > 30:
-                        if self.register_service():
-                            last_register_time = current_time
-                            registration_failures = 0  # Reset failure counter on success
-                            # Force a refresh of known services after re-registration
-                            self.browse()
-                        else:
-                            registration_failures += 1
-                            if registration_failures >= max_failures:
-                                logger.error("Too many registration failures, restarting discovery")
-                                # Clean up and reinitialize
-                                self.unregister()
-                                time.sleep(1)
-                                if not self._stop_event.is_set():
-                                    self.zeroconf = None
-                                    self._loop = None
-                                    self.run()  # Restart discovery
-                                return
-                    
-                    # Clean up stale peers every 60 seconds
-                    if current_time - last_cleanup_time > 60:
-                        with self._peers_lock:
-                            current_peers = dict(self.peers)
-                            for device_id, (ip, port) in current_peers.items():
-                                try:
-                                    # Try to get fresh service info
-                                    service_name = f"{device_id}.{SERVICE_TYPE}"
-                                    info = self.zeroconf.get_service_info(SERVICE_TYPE, service_name)
-                                    if not info:
-                                        logger.info(f"Removing stale peer: {device_id}")
-                                        del self.peers[device_id]
-                                except Exception:
-                                    logger.debug(f"Error checking peer {device_id}, removing")
-                                    del self.peers[device_id]
-                            last_cleanup_time = current_time
-                    
-                    self._stop_event.wait(timeout=5)
-                    if not self._stop_event.is_set():
-                        logger.debug(f"Current peers: {self.get_peers()}")
-                except Exception as e:
-                    logger.error(f"Error in discovery loop: {e}", exc_info=True)
-                    if not self._stop_event.is_set():
-                        time.sleep(5)  # Wait before retrying
-                    
+        self._is_running = True
+        # Create a new event loop for this thread to manage Zeroconf's async operations
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop) 
+
+        # Initialize Zeroconf without the 'loop' argument as it's not universally supported in this version
+        self.zeroconf_instance = Zeroconf()
+        
+        local_ip = self._get_local_ip()
+        logger.info(f"Using interface {local_ip} for Zeroconf.")
+
+        # Register self as a service
+        properties = {"device_id": self.device_id.encode('utf-8')} # Encode properties to bytes
+        self.service_info = ServiceInfo(
+            SERVICE_TYPE,
+            name=f"{self.instance_name}.{SERVICE_TYPE}", # Full service name
+            addresses=[socket.inet_aton(local_ip)],
+            port=self.port,
+            properties=properties, 
+            # ttl=TTL_SECONDS # Removed 'ttl' argument as it's not universally supported
+        )
+        logger.info(f"Registering service: {self.service_info.name} on {local_ip}:{self.port}")
+        self.zeroconf_instance.register_service(self.service_info)
+        logger.info(f"Service registered successfully: {self.service_info.name}")
+
+        # Start browsing for other services immediately.
+        # The `call_soon_threadsafe` in _on_service_state_change will handle scheduling
+        # the info requests safely onto this loop.
+        self.browser = ServiceBrowser(self.zeroconf_instance, SERVICE_TYPE, handlers=[self._on_service_state_change])
+        logger.info("Starting to browse for services of type: %s", SERVICE_TYPE)
+        
+        # Now, run the asyncio event loop indefinitely
+        try:
+            self._loop.run_forever()
+        except KeyboardInterrupt:
+            logger.info("Discovery loop interrupted by KeyboardInterrupt.")
         except Exception as e:
-            logger.error(f"Error in discovery service: {str(e)}", exc_info=True)
+            logger.error(f"Error in discovery event loop: {e}", exc_info=True)
         finally:
-            self.unregister()
+            logger.info(f"Discovery loop for {self.device_id} is stopping.")
+            # Ensure unregistration is called when the loop stops
+            self.unregister() 
+
 
     def unregister(self):
-        """Unregister services with improved cleanup"""
-        logger.info("Attempting to unregister services and close zeroconf.")
-        self._stop_event.set()
-        
-        # Cancel browser first and wait for it to fully stop
-        if self.browser:
-            try:
-                self.browser.cancel()
-                logger.info("Service browser canceled.")
-                # Give the browser time to fully cancel
-                time.sleep(0.2)
-            except Exception as e:
-                logger.debug(f"Error canceling browser: {e}")
-            finally:
-                self.browser = None
-        
-        # Store reference to zeroconf before clearing
-        zeroconf = self.zeroconf
-        self.zeroconf = None
-        self._loop = None
-        self._service_info = None
-        
-        if zeroconf:
-            try:
-                # Unregister service without timeout
-                if self._service_info:
-                    try:
-                        zeroconf.unregister_service(self._service_info)
-                        logger.info("Service unregistered.")
-                    except Exception as e:
-                        logger.debug(f"Error during service unregistration: {e}")
-                
-                # Close zeroconf without timeout
-                try:
-                    zeroconf.close()
-                    logger.info("Zeroconf closed.")
-                except Exception as e:
-                    logger.debug(f"Error during zeroconf close: {e}")
-                
-            except Exception as e:
-                logger.error(f"Error during cleanup: {e}", exc_info=True)
+        """Unregisters services and closes Zeroconf instance."""
+        if not self._is_running:
+            logger.info("Discovery service not running, no need to unregister.")
+            return
 
+        logger.info(f"Attempting to unregister services and close zeroconf for {self.device_id}.")
+        try:
+            # Call the synchronous close method on the Zeroconf instance.
+            # This method in older versions typically handles unregistering services
+            # and stopping the browser automatically.
+            if self.zeroconf_instance:
+                self.zeroconf_instance.close()
+                logger.info("Zeroconf instance closed.")
+            
+            # Attempt to stop and close the asyncio loop.
+            if self._loop and self._loop.is_running():
+                self._loop.call_soon_threadsafe(self._loop.stop)
+            elif self._loop and not self._loop.is_closed():
+                # If the loop is not running but not closed, close it.
+                self._loop.close()
+                logger.info("Asyncio loop closed.")
+
+
+        except Exception as e:
+            logger.error(f"Error unregistering Zeroconf services for {self.device_id}: {e}", exc_info=True)
+        finally:
+            self._is_running = False
+            self.browser = None
+            self.service_info = None
+            self.zeroconf_instance = None
+            self.peers = {} # Clear peers on shutdown
+            if self._loop and self._loop.is_closed():
+                self._loop = None
+
+
+    def get_peers(self) -> Dict[str, Tuple[str, int]]:
+        """Returns the currently discovered peers."""
+        # Clean up peers that are no longer active (optional, Zeroconf handles this over time)
+        # For a truly robust system, this might involve checking timestamps or last-seen times.
+        return self.peers
+
+
+# --- Test code for demonstration ---
+def run_discovery_instance(port, device_id):
+    """Function to run a PeerDiscovery instance in a separate thread."""
+    discovery_instance = PeerDiscovery(port=port, device_id=device_id)
+    # Store the instance so we can access its methods from the main thread if needed
+    global_discovery_instances[device_id] = discovery_instance
+    discovery_instance.run() # This call blocks the thread until unregister is called
+
+def monitor_peers(discovery_instance: PeerDiscovery, interval: int = 5):
+    """Monitors and prints the peers discovered by an instance."""
+    while True:
+        if not discovery_instance._is_running:
+            logger.info(f"Monitor for {discovery_instance.device_id} stopping as discovery is not running.")
+            break
+        peers = discovery_instance.get_peers()
+        if peers:
+            logger.info(f"[{discovery_instance.device_id}] Discovered peers: {peers}")
+        else:
+            logger.info(f"[{discovery_instance.device_id}] No peers discovered yet.")
+        time.sleep(interval)
+
+# Global dictionary to hold discovery instances for managing them from main thread
+global_discovery_instances: Dict[str, PeerDiscovery] = {}
 
 if __name__ == "__main__":
-    discovery = PeerDiscovery(port=settings.http_port)
-    thread = Thread(target=discovery.run, daemon=True)
-    thread.start()
-    logger.info("Discovery started. Press Ctrl+C to stop.")
+    logger.info("Starting PeerDiscovery demonstration...")
+
+    # Generate unique device IDs for our test instances
+    device_id_1 = f"test-device-A-{str(uuid.uuid4())[:8]}"
+    device_id_2 = f"test-device-B-{str(uuid.uuid4())[:8]}"
+
+    port_1 = 5000
+    port_2 = 5001
+
+    # Create threads for each discovery instance
+    # Each PeerDiscovery instance needs its own event loop, so running in separate threads is appropriate.
+    thread_dev1 = threading.Thread(target=run_discovery_instance, args=(port_1, device_id_1), name=f"DiscoveryThread-{device_id_1}")
+    thread_dev2 = threading.Thread(target=run_discovery_instance, args=(port_2, device_id_2), name=f"DiscoveryThread-{device_id_2}")
+
+    # Start the discovery threads
+    thread_dev1.start()
+    thread_dev2.start()
+
+    logger.info("Discovery instances started. Waiting for discovery...")
+
     try:
-        while thread.is_alive():
-            thread.join(timeout=1)
+        # Give some time for discovery to happen and for threads to become fully ready
+        print("\n--- Monitoring peers for 30 seconds (Press Ctrl+C to stop early) ---\n")
+        
+        # Give a small delay for the discovery instances' threads to start up.
+        # This is separate from the asyncio loop's internal readiness.
+        time.sleep(2) 
+
+        # Start monitoring threads for each discovery instance
+        monitor_thread_dev1 = threading.Thread(target=monitor_peers, args=(global_discovery_instances[device_id_1],), name=f"MonitorThread-{device_id_1}")
+        monitor_thread_dev2 = threading.Thread(target=monitor_peers, args=(global_discovery_instances[device_id_2],), name=f"MonitorThread-{device_id_2}")
+        
+        monitor_thread_dev1.start()
+        monitor_thread_dev2.start()
+
+        # Keep the main thread alive for a duration or until interrupted
+        time.sleep(30) # Run for 30 seconds
+
     except KeyboardInterrupt:
-        logger.info("KeyboardInterrupt received in main, stopping discovery.")
-        discovery.unregister()
-        thread.join(timeout=5)
-        if thread.is_alive():
-            logger.warning("Discovery thread did not stop gracefully after unregister.")
-    except Exception as e:
-        logger.error(f"Exception in main: {e}", exc_info=True)
-        discovery.unregister()
-        thread.join(timeout=5)
+        logger.info("KeyboardInterrupt received. Stopping discovery services...")
     finally:
-        logger.info("Application finished.")
+        # Ensure unregister is called on both instances
+        logger.info("Attempting to unregister both discovery instances...")
+        if device_id_1 in global_discovery_instances:
+            global_discovery_instances[device_id_1].unregister()
+        if device_id_2 in global_discovery_instances:
+            global_discovery_instances[device_id_2].unregister()
+
+        # Wait for discovery threads to finish
+        logger.info("Waiting for discovery threads to join...")
+        thread_dev1.join(timeout=10)
+        thread_dev2.join(timeout=10)
+
+        # Wait for monitor threads to finish (they will stop once discovery is unregistered)
+        logger.info("Waiting for monitor threads to join...")
+        if monitor_thread_dev1.is_alive():
+            logger.warning(f"Monitor thread {monitor_thread_dev1.name} is still alive. Joining.")
+            monitor_thread_dev1.join(timeout=5)
+        if monitor_thread_dev2.is_alive():
+            logger.warning(f"Monitor thread {monitor_thread_dev2.name} is still alive. Joining.")
+            monitor_thread_dev2.join(timeout=5)
+
+        logger.info("PeerDiscovery demonstration finished.")
