@@ -22,10 +22,7 @@ from shared.logging_config import setup_logger
 
 logger = setup_logger(__name__)
 
-# Initialize security_manager for workers as they need it for encryption/decryption
-# This instance will be shared. The key needs to be explicitly set on it.
-security_manager = SecurityManager(CONFIG_DIR)
-
+# security_manager is now passed to workers directly.
 
 class ProgressFileReader:
     """
@@ -146,7 +143,7 @@ class UploadWorker(QThread):
     progress = pyqtSignal(int, str)  # progress percentage, status message
     finished = pyqtSignal(bool, str)  # success, message
     
-    def __init__(self, ip: str, port: int, token: str, source_path: str, dest_path: str, is_folder: bool, parent=None):
+    def __init__(self, ip: str, port: int, token: str, source_path: str, dest_path: str, is_folder: bool, parent=None, security_manager=None):
         super().__init__(parent)
         self.ip = ip
         self.port = port
@@ -155,6 +152,7 @@ class UploadWorker(QThread):
         self.dest_path = dest_path # Dest path is remote absolute (passed as is)
         self.is_folder = is_folder
         self._is_cancelled = False # Internal flag for cancellation
+        self.security_manager = security_manager
         
         # Initialize requests session with SSL verification disabled and retry strategy
         self._session = requests.Session()
@@ -169,17 +167,17 @@ class UploadWorker(QThread):
         adapter = requests.adapters.HTTPAdapter(max_retries=retry_strategy)
         self._session.mount("https://", adapter)
 
-        # --- IMPORTANT: Ensure security_manager has the key in this thread's context ---
-        # The key is loaded in main.py and stored in the global security_manager.
-        # We need to explicitly tell this thread's context to use it if not already set.
-        encryption_key_bytes = security_manager.get_encryption_key() # Get the key loaded by main.py
+        # --- IMPORTANT: Ensure self.security_manager has the key for this thread's context ---
+        # The key is loaded in the main thread. We check here to ensure it's available
+        # before the worker attempts any encryption operations.
+        encryption_key_bytes = self.security_manager.get_encryption_key()
         if encryption_key_bytes:
-            security_manager.set_encryption_key(encryption_key_bytes) # Set it for this thread's operations
-            logger.debug("UploadWorker: Encryption key set for worker thread.")
+            logger.debug("UploadWorker: Encryption key is available for worker thread.")
+            self._encryption_key_missing = False
         else:
             logger.error("UploadWorker: Encryption key NOT available. Uploads will fail encryption step.")
-            # Set a flag or raise error in run() to prevent actual upload attempt
-            self._encryption_key_missing = True # Custom flag
+            # Set a flag to prevent actual upload attempt
+            self._encryption_key_missing = True
         # --- End IMPORTANT ---
 
 
@@ -243,7 +241,7 @@ class UploadWorker(QThread):
                 original_data = f_read.read()
 
             # Encrypt data
-            encrypted_data = security_manager.encrypt_data(original_data)
+            encrypted_data = self.security_manager.encrypt_data(original_data)
             encrypted_size = len(encrypted_data)
             
             # Write encrypted data to a temporary file for streaming
@@ -420,7 +418,7 @@ class UploadWorker(QThread):
                             original_data = f_read.read()
 
                         # Encrypt data
-                        encrypted_data = security_manager.encrypt_data(original_data)
+                        encrypted_data = self.security_manager.encrypt_data(original_data)
                         
                         # Add encrypted data to the zip using the sanitized relative path
                         zipf.writestr(arcname, encrypted_data)
@@ -581,106 +579,100 @@ class DownloadProcess(QObject):
     finished = pyqtSignal(bool, str)  # success, message
     cleanup = pyqtSignal()  # signal to main window to clean up resources
     
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, security_manager: SecurityManager = None):
         super().__init__(parent)
-        self.process = QProcess()
+        self.process = QProcess(self)
+        self.is_running = False
+        self._last_progress_update = 0
+        self._progress_update_interval = 0.1  # seconds
+        self.security_manager = security_manager
+
+        # Set up process signals
         self.process.readyReadStandardOutput.connect(self._handle_output)
         self.process.finished.connect(self._handle_finished)
         self.process.errorOccurred.connect(self._handle_process_error)
-        self.is_running = False
-        self._last_progress_update = 0
-        self._progress_update_interval = 0.1  # Update every 100ms
         
+        logger.debug("DownloadProcess initialized with process ID: %s", id(self))
+
     def start_download(self, ip: str, port: int, token: str, items: list, download_dir: str, is_folder: bool):
-        """
-        Starts the download process by executing `download_script.py` in a new process.
-        Passes necessary arguments including the encryption key.
-        Items are now lists of [remote_absolute_path, original_name].
-        """
+        """Starts the download process in a separate Python process."""
         try:
             if self.is_running:
-                logger.warning("Download process already running.")
+                logger.warning("Attempted to start download while process is already running")
                 return
-            
-            # Get the encryption key from the main process's security_manager
-            encryption_key_bytes = security_manager.get_encryption_key()
-            if encryption_key_bytes is None:
-                logger.error("Download blocked: Encryption key not loaded.")
-                for i in range(3):
-                    password, ok = QInputDialog.getText(None, "P2PShare Security Login",
-                                                        "Enter your security code (password):",
-                                                        QLineEdit.Password)
-                    if not ok or not password:
-                        QMessageBox.warning(None, "Security Warning", "Security code cannot be empty. Please enter your code.")
-                        if not ok: 
-                            logger.critical("Security code input cancelled. Exiting application.")
-                        continue
 
-                    if security_manager.load_security(password):
-                        QMessageBox.information(None, "Security Login Success", "Security code accepted!")
-                        break
-                    else:
-                        QMessageBox.warning(None, "Security Warning", "Incorrect security code. Please try again.")
+            logger.info("Starting download - IP: %s, Port: %d, Is Folder: %s, Download Dir: %s", 
+                       ip, port, is_folder, download_dir)
+            logger.debug("Items to download: %s", items)
             
-            encryption_key_bytes = security_manager.get_encryption_key()
-            if encryption_key_bytes is None:
-                raise ValueError("Encryption key is not loaded. Cannot download/decrypt files securely.")
+            # Convert items list to base64 for command line
+            items_b64 = base64.b64encode(json.dumps(items).encode()).decode()
             
-            # Base64 encode the encryption key to pass it as a command-line argument
-            encryption_key_b64 = base64.b64encode(encryption_key_bytes).decode('utf-8')
-
-            # Convert items (list of [remote_path, name]) to base64 encoded JSON
-            items_json = json.dumps(items, ensure_ascii=False)
-            items_b64 = base64.b64encode(items_json.encode('utf-8')).decode('utf-8')
+            # --- IMPORTANT: Get the encryption key to pass to the subprocess ---
+            if not self.security_manager:
+                raise RuntimeError("SecurityManager not provided to DownloadProcess.")
+            encryption_key = self.security_manager.get_encryption_key()
+            if not encryption_key:
+                raise RuntimeError("Encryption key not found, cannot start secure download.")
+            encryption_key_b64 = base64.b64encode(encryption_key).decode('utf-8')
+            # --- End IMPORTANT ---
             
-            # Build command to execute the download script
             script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'download_script.py')
             cmd = [
-                sys.executable, # Path to python interpreter
+                sys.executable,
                 script_path,
                 ip,
                 str(port),
                 token,
                 items_b64,
-                download_dir,
-                str(is_folder).lower(), # 'true' or 'false'
-                encryption_key_b64 # This is the 8th argument (index 7)
+                os.path.abspath(download_dir),
+                str(is_folder).lower(),
+                encryption_key_b64  # Pass the key as the last argument
             ]
             
-            # Debugging: Print the full command list *before* starting the process
-            # WARNING: Do not log the key itself in production logs!
-            logger.debug(f"DownloadProcess cmd list: {cmd[:-1]} [encryption_key_b64_present: {bool(encryption_key_b64)}]")
+            logger.debug("Download script path: %s", script_path)
+            logger.debug("Python interpreter path: %s", sys.executable)
             
             # Start the QProcess
             self.process.start(cmd[0], cmd[1:])
-            if not self.process.waitForStarted(5000):  # Wait up to 5 seconds for process to start
-                raise RuntimeError(f"Failed to start download process. Error: {self.process.errorString()}")
-                
-            self.is_running = True
+            if not self.process.waitForStarted(10000):
+                error = self.process.errorString()
+                logger.error("Process failed to start - Error: %s", error)
+                raise RuntimeError(f"Failed to start download process: {error}")
             
-        except ValueError as ve:
-            error_msg = f"Failed to start download: {ve}. (Security key missing or invalid items?)"
-            logger.error(error_msg, exc_info=True)
-            self.finished.emit(False, error_msg)
-            self.cleanup.emit() # Ensure cleanup is triggered
+            self.is_running = True
+            logger.info("Download process started successfully with PID: %s", self.process.processId())
+            
         except Exception as e:
-            error_msg = f"Failed to start download process: {str(e)}"
-            logger.error(error_msg, exc_info=True)
-            self.finished.emit(False, error_msg)
-            self.cleanup.emit() # Ensure cleanup is triggered
+            logger.error("Download start failed", exc_info=True)
+            self.finished.emit(False, f"Failed to start download: {str(e)}")
+            self.cleanup.emit()
 
     def stop(self):
         """Stops the underlying QProcess, effectively cancelling the download."""
-        logger.info("Stopping download process...")
+        process_id = self.process.processId() if hasattr(self, 'process') else None
+        logger.info("Stopping download process (PID: %s)...", process_id)
+        
+        if not hasattr(self, 'process'):
+            logger.warning("Stop called but process attribute doesn't exist")
+            return
+            
         if self.process.state() == QProcess.Running:
             try:
-                self.process.kill() # Terminate the process forcefully
-                if not self.process.waitForFinished(3000): # Wait up to 3 seconds for termination
-                    logger.warning("Download process did not finish in time after kill.")
+                logger.debug("Attempting to kill process %s", process_id)
+                self.process.kill()
+                if not self.process.waitForFinished(3000):
+                    logger.warning("Process %s did not finish within timeout after kill signal", process_id)
+                else:
+                    logger.debug("Process %s successfully terminated", process_id)
             except Exception as e:
-                logger.error(f"Error stopping download process: {str(e)}")
+                logger.error("Error stopping process %s: %s", process_id, str(e), exc_info=True)
+        else:
+            logger.debug("Process %s is not running (current state: %s)", 
+                        process_id, self.process.state())
+            
         self.is_running = False
-        self.cleanup.emit() # Ensure cleanup signal is emitted upon stopping
+        self.cleanup.emit()
 
     def _handle_output(self):
         """Reads stdout from the subprocess and processes JSON messages (progress, errors)."""
@@ -689,54 +681,71 @@ class DownloadProcess(QObject):
             current_time = time.time()
             
             for line in output.splitlines():
+                logger.debug("Raw output from download process: %s", line)
                 try:
                     data = json.loads(line)
                     if 'progress' in data:
-                        # Throttle progress updates to avoid overwhelming the GUI
                         if current_time - self._last_progress_update >= self._progress_update_interval:
+                            logger.debug("Progress update: %d%% - %s", 
+                                       data['progress'], data.get('status', ''))
                             self.progress.emit(data['progress'], data.get('status', ''))
                             self._last_progress_update = current_time
                     elif 'error' in data:
-                        logger.error(f"Download subprocess error: {data['error']}")
+                        logger.error("Download subprocess error: %s", data['error'])
                         self.finished.emit(False, data['error'])
-                        self.stop() # Stop the process on receiving an error from subprocess
-                    elif 'message' in data: # Generic messages from subprocess
-                        logger.info(f"Download subprocess message: {data['message']}")
+                        self.stop()
+                    elif 'message' in data:
+                        logger.info("Download subprocess message: %s", data['message'])
                 except json.JSONDecodeError:
-                    logger.warning(f"Invalid JSON output from download process: {line}")
-                except Exception as e:
-                    logger.error(f"Error processing output line from download process: {str(e)}")
+                    logger.debug("Non-JSON output from download script: %s", line)
         except Exception as e:
-            logger.error(f"Error reading process output: {str(e)}")
+            logger.error("Error processing download output", exc_info=True)
 
     def _handle_finished(self, exit_code: int, exit_status: QProcess.ExitStatus):
         """Handles the completion of the subprocess (normal exit or crash)."""
         try:
             self.is_running = False
+            process_id = self.process.processId()
+            
+            logger.info("Download process (PID: %s) finished - Exit code: %d, Status: %s", 
+                       process_id, exit_code, exit_status)
+            
             if exit_code == 0:
+                logger.info("Download completed successfully")
                 self.finished.emit(True, "Download completed successfully")
             else:
-                error_msg = f"Download failed with exit code {exit_code}. Exit status: {exit_status}"
                 stderr_output = self.process.readAllStandardError().data().decode('utf-8')
+                error_msg = f"Download failed with exit code {exit_code}. Exit status: {exit_status}"
                 if stderr_output:
                     error_msg += f"\nStderr: {stderr_output.strip()}"
+                    logger.error("Process stderr output: %s", stderr_output.strip())
                 logger.error(error_msg)
                 self.finished.emit(False, error_msg)
         except Exception as e:
-            logger.error(f"Error handling process completion: {str(e)}")
+            logger.error("Error handling process completion", exc_info=True)
         finally:
-            self.cleanup.emit() # Always ensure cleanup is triggered
+            self.cleanup.emit()
 
     def _handle_process_error(self, process_error: QProcess.ProcessError):
         """Handles errors directly reported by QProcess (e.g., process failed to start)."""
         try:
             error_msg = f"Download process error: {self.process.errorString()} (Code: {process_error})"
-            logger.error(error_msg)
+            logger.error("QProcess error occurred - %s", error_msg)
+            logger.debug("Process state at error: %s", self.process.state())
             self.finished.emit(False, error_msg)
         except Exception as e:
-            logger.error(f"Error handling QProcess error signal: {str(e)}")
+            logger.error("Error handling QProcess error signal", exc_info=True)
         finally:
-            self.cleanup.emit() # Always ensure cleanup is triggered
+            self.cleanup.emit()
+
+    def __del__(self):
+        # Only attempt to kill the process during deletion, skip signal emission
+        if hasattr(self, 'process') and self.process.state() == QProcess.Running:
+            try:
+                logger.debug("Cleaning up download process in destructor")
+                self.process.kill()
+            except Exception:
+                pass  # Ignore any errors during cleanup
 
 
 class TokenFetcher(QThread):

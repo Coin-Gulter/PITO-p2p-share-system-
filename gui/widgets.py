@@ -9,12 +9,12 @@ from pathlib import Path
 from datetime import datetime
 import platform # To detect OS for drive listing (needed if browsing outside CWD)
 
-# Import security_manager from shared module, as it's a global dependency for security operations
-from shared.security_manager import SecurityManager
+# Import self.security_manager from shared module, as it's a global dependency for security operations
+# from shared.security_manager import SecurityManager
 from shared.config import CONFIG_DIR # Assuming CONFIG_DIR is needed for SecurityManager init
 
-# Initialize security_manager, as it's a critical dependency for SecuritySettingsDialog
-security_manager = SecurityManager(CONFIG_DIR)
+# Initialize self.security_manager, as it's a critical dependency for SecuritySettingsDialog
+# self.security_manager = SecurityManager(CONFIG_DIR)
 
 
 class FileBrowser(QTreeWidget):
@@ -50,12 +50,13 @@ class FileBrowser(QTreeWidget):
 class SecuritySettingsDialog(QDialog):
     """
     A dialog for viewing security settings and changing the security code.
-    It interacts directly with the global security_manager instance.
+    It interacts directly with the global self.security_manager instance.
     """
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, security_manager=None):
         super().__init__(parent)
         self.setWindowTitle("Security Settings")
         self.setFixedSize(400, 200) # Fixed size for simplicity
+        self.security_manager = security_manager
         
         layout = QFormLayout()
 
@@ -66,7 +67,7 @@ class SecuritySettingsDialog(QDialog):
         layout.addRow(self.hash_label, self.hash_value)
 
         # Get and display the current hash
-        stored_hash = security_manager.get_stored_hash_b64()
+        stored_hash = self.security_manager.get_stored_hash_b64()
         if stored_hash:
             self.hash_value.setText(stored_hash)
         
@@ -78,7 +79,7 @@ class SecuritySettingsDialog(QDialog):
 
     def _change_password_dialog(self):
         """Handles the 'Change Security Code' process, prompting for old and new codes."""
-        if not security_manager.is_initialized():
+        if not self.security_manager.is_initialized():
             QMessageBox.warning(self, "Security", "Security is not initialized. Please restart to set it up.")
             return
 
@@ -89,7 +90,7 @@ class SecuritySettingsDialog(QDialog):
             return
 
         # Verify old password
-        if not security_manager.load_security(old_password): # Temporarily load to verify
+        if not self.security_manager.load_security(old_password): # Temporarily load to verify
             QMessageBox.warning(self, "Incorrect Old Code", "The old security code you entered is incorrect.")
             return
 
@@ -110,10 +111,10 @@ class SecuritySettingsDialog(QDialog):
                 continue
             break
 
-        if security_manager.change_password(old_password, new_password):
+        if self.security_manager.change_password(old_password, new_password):
             QMessageBox.information(self, "Success", "Security code changed successfully!")
             # Update displayed hash after successful change
-            self.hash_value.setText(security_manager.get_stored_hash_b64())
+            self.hash_value.setText(self.security_manager.get_stored_hash_b64())
         else:
             QMessageBox.critical(self, "Error", "Failed to change security code. Please check logs.")
 

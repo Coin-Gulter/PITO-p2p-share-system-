@@ -115,7 +115,7 @@ chosen_http_port = find_available_port(start_port=5000, end_port=6000)
 
 settings = Settings(
     device_id=device_id,
-    share_dir=HOME / "P2PShare",
+    share_dir=HOME / ".p2pshare",
     http_port=chosen_http_port,
     tls_cert=CONFIG_DIR / "device_cert.pem",
     tls_key=CONFIG_DIR / "device_key.pem",
