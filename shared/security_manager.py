@@ -5,6 +5,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import padding
 import json
 from pathlib import Path
 import base64
@@ -20,10 +21,10 @@ IV_LENGTH = 16      # For AES-CBC (16 bytes)
 SECURITY_FILE_NAME = "security_info.json"
 
 class SecurityManager:
-    def __init__(self, config_dir: Path):
+    def __init__(self, config_dir: Path, encryption_key: bytes = None):
         self.config_dir = config_dir
         self.security_file_path = self.config_dir / SECURITY_FILE_NAME
-        self._encryption_key = None # Store the derived key in memory
+        self._encryption_key = encryption_key # Store the derived key in memory
 
     def _generate_salt(self) -> bytes:
         """Generates a random salt for PBKDF2."""
@@ -154,7 +155,7 @@ class SecurityManager:
         encryptor = cipher.encryptor()
         
         # Pad the data to be a multiple of the block size (16 bytes for AES)
-        padder = modes.CBC.padding_algorithm.pkcs7.padder()
+        padder = padding.PKCS7(128).padder()
         padded_data = padder.update(data) + padder.finalize()
 
         ciphertext = encryptor.update(padded_data) + encryptor.finalize()
@@ -176,7 +177,7 @@ class SecurityManager:
         decrypted_padded_data = decryptor.update(ciphertext) + decryptor.finalize()
         
         # Unpad the data
-        unpadder = modes.CBC.padding_algorithm.pkcs7.unpadder()
+        unpadder = padding.PKCS7(128).unpadder()
         data = unpadder.update(decrypted_padded_data) + unpadder.finalize()
         return data
 

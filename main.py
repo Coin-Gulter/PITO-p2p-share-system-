@@ -25,6 +25,11 @@ class ServerManager(QObject):
     def __init__(self):
         super().__init__()
         self.server = None
+        self.config = None  # Will be created after security setup
+        self.should_run = True
+        
+    def _create_config(self):
+        """Create the uvicorn config after security setup is complete."""
         self.config = uvicorn.Config(
             "backend.server:app",
             host="0.0.0.0",
@@ -38,11 +43,13 @@ class ServerManager(QObject):
             timeout_keep_alive=30,
             timeout_graceful_shutdown=10
         )
-        self.should_run = True
         
     def start(self):
         """Start the server in a non-blocking way"""
         try:
+            # Create config only when starting (after security setup)
+            self._create_config()
+            
             logger.info(f"Starting backend server on port {settings.http_port}")
             self.server = uvicorn.Server(self.config)
             self.server_thread = threading.Thread(target=self._run_server, daemon=True)

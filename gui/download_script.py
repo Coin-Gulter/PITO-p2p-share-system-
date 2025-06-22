@@ -8,17 +8,39 @@ import base64
 import zipfile
 import shutil
 import time
+import logging
+from datetime import datetime
+
+# Add project root to path to allow direct execution
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
 # Import shared modules
 from shared.security_manager import SecurityManager
 from shared.config import CONFIG_DIR # Needed for SecurityManager
 from shared.logging_config import setup_logger
 
-logger = setup_logger(__name__)
+# Set up logging with process ID for better tracking
+logger = setup_logger(f"{__name__}_{os.getpid()}")
+logger.info("Download script started with PID: %d", os.getpid())
+
+def log_system_info():
+    """Log system information for debugging purposes."""
+    logger.debug("System Information:")
+    logger.debug("Python Version: %s", sys.version)
+    logger.debug("Platform: %s", sys.platform)
+    logger.debug("Working Directory: %s", os.getcwd())
+    logger.debug("Script Location: %s", os.path.abspath(__file__))
+    logger.debug("Temp Directory: %s", tempfile.gettempdir())
+    logger.debug("CONFIG_DIR: %s", CONFIG_DIR)
+
+# Log system info at startup
+log_system_info()
 
 # Re-initialize security_manager in this subprocess
-# It will load the key passed via command line.
-security_manager = SecurityManager(CONFIG_DIR)
+# The key will be passed directly during initialization below.
+security_manager = None
 
 class DecryptionError(Exception):
     """Custom exception for decryption failures."""
@@ -35,17 +57,35 @@ def print_json_message(progress=None, status=None, error=None, message=None):
         output['error'] = error
     if message is not None:
         output['message'] = message
-    print(json.dumps(output), flush=True) # Ensure output is flushed immediately
+    
+    # Log the message being sent to parent process
+    if error:
+        logger.error("Sending error to parent: %s", error)
+    elif message:
+        logger.debug("Sending message to parent: %s", message)
+    elif status:
+        logger.debug("Sending status update: %s (Progress: %s%%)", status, progress)
+        
+    print(json.dumps(output), flush=True)
 
-def decrypt_data(encrypted_data: bytes) -> bytes:
-    """Decrypts data using the loaded encryption key."""
+def decrypt_data(encrypted_data: bytes, sec_manager_instance: SecurityManager) -> bytes:
+    """Decrypts data using the provided SecurityManager instance."""
     try:
-        decrypted_data = security_manager.decrypt_data(encrypted_data)
+        logger.debug("Starting decryption of %d bytes", len(encrypted_data))
+        start_time = time.time()
+        
+        decrypted_data = sec_manager_instance.decrypt_data(encrypted_data)
+        
         if decrypted_data is None:
             raise DecryptionError("Decryption returned None, likely incorrect key or corrupted data.")
+        
+        duration = time.time() - start_time
+        logger.debug("Decryption completed in %.2f seconds. Decrypted size: %d bytes", 
+                    duration, len(decrypted_data))
         return decrypted_data
+        
     except Exception as e:
-        logger.error(f"Failed to decrypt data: {e}", exc_info=True)
+        logger.error("Decryption failed", exc_info=True)
         raise DecryptionError(f"Decryption failed: {e}")
 
 def download_file_from_peer(ip, port, token, remote_path, local_filename, download_dir):
@@ -54,53 +94,81 @@ def download_file_from_peer(ip, port, token, remote_path, local_filename, downlo
     try:
         url = f"https://{ip}:{port}/download"
         headers = {"Authorization": f"Bearer {token}"}
-        params = {"path": remote_path} # remote_path is now the absolute path on the peer
+        params = {"path": remote_path}
         
-        logger.info(f"Downloading file from {ip}:{port}{remote_path} to {download_dir}/{local_filename}")
+        logger.info("Starting download - Remote: %s, Local: %s", remote_path, local_filename)
+        logger.debug("Download URL: %s, Headers: %s, Params: %s", url, 
+                    {k: v[:10] + '...' if k == 'Authorization' else v for k, v in headers.items()}, 
+                    params)
         
         # Stream the download to a temporary encrypted file
         with tempfile.NamedTemporaryFile(delete=False, dir=CONFIG_DIR) as temp_file:
             temp_encrypted_path = Path(temp_file.name)
-            logger.debug(f"Saving encrypted stream to temporary file: {temp_encrypted_path}")
+            logger.debug("Created temporary file for encrypted data: %s", temp_encrypted_path)
             
             with requests.get(url, headers=headers, params=params, stream=True, verify=False, timeout=(30, 300)) as r:
-                r.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+                r.raise_for_status()
                 
                 total_size = int(r.headers.get('content-length', 0))
+                logger.info("Download started - Total size: %d bytes", total_size)
+                
                 bytes_downloaded = 0
                 last_progress = -1
+                chunk_count = 0
+                start_time = time.time()
                 
                 for chunk in r.iter_content(chunk_size=8192):
                     if chunk:
                         temp_file.write(chunk)
                         bytes_downloaded += len(chunk)
+                        chunk_count += 1
                         
                         # Update progress
                         if total_size > 0:
                             progress = int((bytes_downloaded / total_size) * 100)
                             if progress != last_progress:
-                                print_json_message(progress=progress, status=f"Downloading: {local_filename} ({progress}%)")
+                                print_json_message(progress=progress, 
+                                                status=f"Downloading: {local_filename} ({progress}%)")
                                 last_progress = progress
+                                
+                                # Log every 10% progress
+                                if progress % 10 == 0:
+                                    elapsed = time.time() - start_time
+                                    speed = bytes_downloaded / (elapsed if elapsed > 0 else 1)
+                                    logger.debug("Download progress - %d%% complete, %.2f MB/s", 
+                                               progress, speed / (1024 * 1024))
+                
+                download_time = time.time() - start_time
+                avg_speed = bytes_downloaded / (download_time if download_time > 0 else 1)
+                
+                logger.info("Download completed - Size: %d bytes, Time: %.2f seconds, Speed: %.2f MB/s, Chunks: %d",
+                          bytes_downloaded, download_time, avg_speed / (1024 * 1024), chunk_count)
                 print_json_message(progress=100, status=f"Downloaded encrypted: {local_filename}")
-                logger.info(f"Finished downloading encrypted file to {temp_encrypted_path}. Total: {bytes_downloaded} bytes.")
 
         # Decrypt the temporary file
-        logger.info(f"Decrypting {local_filename}...")
-        print_json_message(progress=0, status=f"Decrypting: {local_filename} (0%)") # Reset progress for decryption phase
+        logger.info("Starting decryption of %s", local_filename)
+        print_json_message(progress=0, status=f"Decrypting: {local_filename} (0%)")
         
+        decryption_start = time.time()
         with open(temp_encrypted_path, 'rb') as f_encrypted:
             encrypted_data = f_encrypted.read()
+            logger.debug("Read %d bytes of encrypted data", len(encrypted_data))
         
-        decrypted_data = decrypt_data(encrypted_data) # Use the subprocess's security_manager
+        decrypted_data = decrypt_data(encrypted_data, security_manager)
         
         output_path = Path(download_dir) / local_filename
-        output_path.parent.mkdir(parents=True, exist_ok=True) # Ensure destination directory exists
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        logger.debug("Created output directory: %s", output_path.parent)
         
         with open(output_path, 'wb') as f_out:
             f_out.write(decrypted_data)
+            
+        decryption_time = time.time() - decryption_start
+        logger.info("Decryption completed - Time: %.2f seconds, Output size: %d bytes",
+                   decryption_time, len(decrypted_data))
         
         print_json_message(progress=100, status=f"Decrypted: {local_filename}")
-        logger.info(f"File {local_filename} downloaded and decrypted successfully to {output_path}")
+        logger.info("File operation completed successfully - %s", local_filename)
         return True
 
     except requests.exceptions.RequestException as e:
@@ -117,8 +185,11 @@ def download_file_from_peer(ip, port, token, remote_path, local_filename, downlo
         print_json_message(error=error_msg)
     finally:
         if temp_encrypted_path and temp_encrypted_path.exists():
-            os.unlink(temp_encrypted_path)
-            logger.debug(f"Cleaned up temporary encrypted file: {temp_encrypted_path}")
+            try:
+                os.unlink(temp_encrypted_path)
+                logger.debug("Cleaned up temporary encrypted file: %s", temp_encrypted_path)
+            except Exception as e:
+                logger.error("Failed to clean up temporary file: %s - %s", temp_encrypted_path, e)
     return False
 
 def download_folder_from_peer(ip, port, token, remote_path, download_dir):
@@ -164,7 +235,7 @@ def download_folder_from_peer(ip, port, token, remote_path, download_dir):
         with open(temp_zip_path, 'rb') as f_encrypted:
             encrypted_data = f_encrypted.read()
         
-        decrypted_zip_data = decrypt_data(encrypted_data) # Decrypt the entire zip data
+        decrypted_zip_data = decrypt_data(encrypted_data, security_manager) # Decrypt the entire zip data
         
         # Write decrypted data to a new temporary zip file for extraction
         temp_decrypted_zip_path = temp_zip_path.with_name(f"decrypted_{temp_zip_path.name}")
@@ -188,17 +259,9 @@ def download_folder_from_peer(ip, port, token, remote_path, download_dir):
             # Let's extract to download_dir, and the zip's internal structure will create subfolders.
 
             # Find the common base dir or folder name in the zip
-            zip_contents_root = None
-            if zip_ref.namelist():
-                # Get the first part of the first name in the zip
-                first_entry_parts = Path(zip_ref.namelist()[0]).parts
-                if first_entry_parts:
-                    zip_contents_root = first_entry_parts[0]
-            
-            if zip_contents_root:
-                extract_path = Path(download_dir)
-            else:
-                extract_path = Path(download_dir) # Extract directly if no common root in zip
+            extract_path = Path(download_dir) / Path(remote_path).parts[-1]
+
+            logger.debug("Extracting path --- %s", extract_path)
 
             # Extract with progress
             total_files_in_zip = len(zip_ref.namelist())
@@ -288,7 +351,7 @@ if __name__ == "__main__":
     # Initialize SecurityManager with the passed encryption key
     try:
         encryption_key_bytes = base64.b64decode(encryption_key_b64)
-        security_manager.set_encryption_key(encryption_key_bytes)
+        security_manager = SecurityManager(config_dir=Path(CONFIG_DIR), encryption_key=encryption_key_bytes)
         logger.info("Encryption key successfully loaded in download_script.py subprocess.")
     except Exception as e:
         print_json_message(error=f"Failed to load encryption key in subprocess: {e}")

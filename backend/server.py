@@ -1,12 +1,12 @@
 # p2pshare/backend/server.py
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Body, Query, Form, Request, Header
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.security import HTTPBearer
 import os, shutil, uuid
 from pathlib import Path
 import jwt
-from shared.config import settings
+from shared.config import settings, CONFIG_DIR
 from shared.logging_config import setup_logger
 from pydantic import BaseModel
 from typing import List, Optional
@@ -17,9 +17,29 @@ import time
 from starlette.background import BackgroundTask
 import base64
 import platform # To detect OS for drive listing
+from shared.security_manager import SecurityManager
+import json
 
 # Set up logger
 logger = setup_logger(__name__)
+
+# --- Security: Initialize SecurityManager for the server ---
+# The encryption key is passed from main.py via an environment variable.
+security_manager = None
+try:
+    encryption_key_b64 = os.environ.get('P2PSHARE_ENCRYPTION_KEY_B64')
+    if encryption_key_b64:
+        encryption_key_bytes = base64.b64decode(encryption_key_b64)
+        # We don't need a password, just the raw key for the existing instance.
+        # The config_dir is needed for potential temp file operations inside manager.
+        security_manager = SecurityManager(config_dir=CONFIG_DIR, encryption_key=encryption_key_bytes)
+        logger.info("Server-side SecurityManager initialized successfully with encryption key.")
+    else:
+        logger.error("P2PSHARE_ENCRYPTION_KEY_B64 environment variable not set. File encryption/decryption will fail.")
+except Exception as e:
+    logger.critical(f"Failed to initialize server-side SecurityManager: {e}", exc_info=True)
+    # This is a critical failure, as the server cannot perform its core security functions.
+    security_manager = None # Ensure it's None on failure
 
 # Auth request model
 class AuthRequest(BaseModel):
@@ -42,7 +62,7 @@ ALGORITHM = "HS256"
 app = FastAPI()
 # SHARE_DIR will no longer be a strict root, but kept for legacy or other uses if needed.
 # For full filesystem sharing, the effective root for browsing becomes the OS root or drive list.
-app.state.SHARE_DIR = Path.home() / "P2PShare" # Still create a default P2PShare dir, but it's not the only browsable root.
+app.state.SHARE_DIR = Path.home() / ".p2pshare" # Still create a default P2PShare dir, but it's not the only browsable root.
 security = HTTPBearer()
 
 # --- Security: Blacklisted paths (crucial for full filesystem sharing) ---
@@ -193,9 +213,16 @@ def list_directory(path: str = Query("/", description="Directory path to list"))
     List contents of a directory.
     When path is "/", lists available drives on Windows or root directory contents on Unix-like systems.
     Otherwise, lists contents of the specified absolute path.
+    The response is an encrypted blob of the JSON-encoded file list.
     """
+    # Security: Ensure security manager is loaded, otherwise cannot encrypt response.
+    if not security_manager or not security_manager.get_encryption_key():
+        logger.critical("Browse endpoint called but security manager is not initialized with key. Cannot proceed.")
+        raise HTTPException(status_code=500, detail="Server encryption is not configured.")
+        
     try:
         target_path: Path
+        items = []
 
         if path == "/":
             if platform.system() == "Windows":
@@ -206,7 +233,6 @@ def list_directory(path: str = Query("/", description="Directory path to list"))
                     if drive_path.exists() and drive_path.is_dir():
                         drive_letters.append(drive_path)
                 
-                items = []
                 for drive_p in drive_letters:
                     if is_path_blacklisted(drive_p):
                         logger.warning(f"Skipping blacklisted drive: {drive_p}")
@@ -214,56 +240,62 @@ def list_directory(path: str = Query("/", description="Directory path to list"))
                     try:
                         # For drives, the 'name' in FileInfo should be just the drive letter (e.g., 'C').
                         # The 'path' should be 'C:/'
-                        items.append(get_file_info_for_client(drive_p))
+                        items.append(get_file_info_for_client(drive_p).model_dump())
                     except Exception as e:
                         logger.warning(f"Error getting info for drive {drive_p}: {e}")
                         continue # Skip problematic drives
                 logger.info(f"Listed available drives: {len(items)} items")
-                return items
             else:
                 # On Unix-like systems, list contents of '/'
                 target_path = Path('/')
+                if is_path_blacklisted(target_path):
+                    raise HTTPException(status_code=403, detail="Access to this path is forbidden.")
+                
+                for item_path in target_path.iterdir():
+                    if is_path_blacklisted(item_path):
+                        continue # Skip blacklisted items within a non-blacklisted dir
+                    try:
+                        items.append(get_file_info_for_client(item_path).model_dump())
+                    except Exception as e:
+                        logger.warning(f"Could not stat {item_path}, skipping: {e}")
+                        continue
+                logger.info(f"Listed contents of root directory: {len(items)} items")
+
         else:
             # For non-root requests, assume path is an absolute path.
             # Convert to Path and resolve to handle '..' etc.
             target_path = Path(path).resolve()
 
-        # Security checks for any requested path (including subdirectories of drives on Windows)
-        if not target_path.exists():
-            raise HTTPException(status_code=404, detail=f"Path not found: {path}")
+            # Security checks for any requested path (including subdirectories of drives on Windows)
+            if not target_path.exists() or not target_path.is_dir():
+                raise HTTPException(status_code=404, detail="Directory not found")
+            if is_path_blacklisted(target_path):
+                raise HTTPException(status_code=403, detail="Access to this path is forbidden.")
             
-        if not target_path.is_dir():
-            raise HTTPException(status_code=400, detail=f"Path is not a directory: {path}")
+            for item_path in target_path.iterdir():
+                if is_path_blacklisted(item_path):
+                    continue
+                try:
+                    items.append(get_file_info_for_client(item_path).model_dump())
+                except Exception as e:
+                    logger.warning(f"Could not stat {item_path}, skipping: {e}")
+                    continue
+            logger.info(f"Listed contents of {path}: {len(items)} items")
+        
+        # Serialize the list of FileInfo dictionaries to a JSON string
+        items_json = json.dumps(items)
+        
+        # Encrypt the JSON string
+        encrypted_data = security_manager.encrypt_data(items_json.encode('utf-8'))
+        
+        # Return the encrypted data as a binary response
+        return Response(content=encrypted_data, media_type="application/octet-stream")
 
-        if is_path_blacklisted(target_path):
-            raise HTTPException(status_code=403, detail="Access to this path is restricted.")
-            
-        items = []
-        for item in target_path.iterdir():
-            if is_path_blacklisted(item):
-                logger.warning(f"Skipping blacklisted item: {item}")
-                continue
-            try:
-                # Check read permissions before trying to get info
-                if os.access(item, os.R_OK):
-                    items.append(get_file_info_for_client(item))
-                else:
-                    logger.warning(f"No read permission for item: {item}. Skipping.")
-            except PermissionError:
-                logger.warning(f"Permission denied for item: {item}. Skipping.")
-            except Exception as e:
-                logger.warning(f"Error getting info for {item}: {str(e)}. Skipping. Trace: {e.__class__.__name__}")
-                # Continue processing other items even if one fails
-                continue
-                
-        logger.info(f"Listed directory: {path} (resolved to {target_path}, {len(items)} items)")
-        return items
     except HTTPException:
-        raise # Re-raise FastAPI HTTPExceptions directly
+        raise # Re-raise HTTP exceptions to let FastAPI handle them
     except Exception as e:
-        logger.error(f"Error listing directory {path}: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error listing directory: {str(e)}")
-
+        logger.error(f"Error listing directory '{path}': {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to list directory: {e}")
 
 @app.get("/file-info", dependencies=[Depends(require_auth)])
 def get_file_info_endpoint(path: str = Query(..., description="Path to get info for")):
@@ -286,7 +318,13 @@ def get_file_info_endpoint(path: str = Query(..., description="Path to get info 
 
 @app.get("/download", dependencies=[Depends(require_auth)])
 def download_file(path: str = Query(..., description="Path of file to download")):
-    """Download a file from any absolute location"""
+    """
+    Encrypts and downloads a file from any absolute location.
+    The file is read, encrypted in memory, and then sent.
+    """
+    if not security_manager:
+        raise HTTPException(status_code=500, detail="Server encryption is not configured. Cannot download file.")
+
     try:
         effective_path = Path(path).resolve()
 
@@ -302,21 +340,40 @@ def download_file(path: str = Query(..., description="Path of file to download")
         if not os.access(effective_path, os.R_OK):
             raise HTTPException(status_code=403, detail="Permission denied to read file.")
 
-        logger.info(f"File download requested: {path} (resolved to {effective_path})")
-        return FileResponse(
-            effective_path, # Use the resolved and validated path
-            filename=effective_path.name,
-            media_type='application/octet-stream'
+        logger.info(f"File download requested: {path}. Reading and encrypting...")
+        
+        # Read file content
+        with open(effective_path, 'rb') as f:
+            file_data = f.read()
+        
+        # Encrypt the file data
+        encrypted_data = security_manager.encrypt_data(file_data)
+        
+        logger.info(f"Sending encrypted file: {effective_path.name}, size: {len(encrypted_data)} bytes")
+
+        # Return the encrypted data as a response
+        return Response(
+            content=encrypted_data,
+            media_type='application/octet-stream',
+            headers={'Content-Disposition': f'attachment; filename="{effective_path.name}"'}
         )
+
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error downloading file {path}: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error downloading file: {str(e)}")
+        logger.error(f"Error encrypting or sending file {path}: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error processing file for download: {str(e)}")
 
 @app.get("/download-folder", dependencies=[Depends(require_auth)])
 def download_folder(path: str = Query(..., description="Path of folder to download")):
-    """Download a folder as a zip file from any absolute location"""
+    """
+    Zips a folder, encrypts the zip, and downloads it.
+    The folder is zipped in a temporary location, then the zip file is
+    encrypted in memory and sent as a response.
+    """
+    if not security_manager:
+        raise HTTPException(status_code=500, detail="Server encryption is not configured. Cannot download folder.")
+
     temp_dir = None
     zip_path = None
     try:
@@ -397,11 +454,20 @@ def download_folder(path: str = Query(..., description="Path of folder to downlo
                     logger.warning(f"Failed to add file/directory to zip during walk {root}: {str(e)}")
                     continue # Try to continue zipping other files
         
-        logger.info(f"Zip file created successfully: {zip_path}")
+        logger.info(f"Zip file created successfully: {zip_path}. Encrypting for download...")
         
         if not zip_path.exists() or not os.access(zip_path, os.R_OK):
             raise HTTPException(status_code=500, detail="Failed to create or read zip file")
-            
+        
+        # Read the created zip file's content
+        with open(zip_path, 'rb') as f_zip:
+            zip_data = f_zip.read()
+
+        # Encrypt the zip data
+        encrypted_zip_data = security_manager.encrypt_data(zip_data)
+        
+        logger.info(f"Sending encrypted folder: {zip_filename}, size: {len(encrypted_zip_data)} bytes")
+
         def cleanup_after_send():
             try:
                 if temp_dir and os.path.exists(temp_dir):
@@ -410,10 +476,10 @@ def download_folder(path: str = Query(..., description="Path of folder to downlo
             except Exception as e:
                 logger.warning(f"Failed to clean up temporary directory {temp_dir}: {str(e)}")
                 
-        response = FileResponse(
-            zip_path,
-            filename=zip_filename,
-            media_type='application/zip',
+        response = Response(
+            content=encrypted_zip_data,
+            media_type='application/octet-stream',
+            headers={'Content-Disposition': f'attachment; filename="{zip_filename}.enc"'},
             background=BackgroundTask(cleanup_after_send)
         )
         return response

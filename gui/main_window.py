@@ -30,7 +30,7 @@ from shared.logging_config import setup_logger
 logger = setup_logger(__name__)
 
 # Global Security Manager instance (from main.py, assuming it's passed or set up)
-# self.security_manager = SecurityManager(CONFIG_DIR) # Re-initialize or ensure it's a global singleton in main.py
+# security_manager = SecurityManager(CONFIG_DIR) # Re-initialize or ensure it's a global singleton in main.py
 
 
 class MainWindow(QWidget):
@@ -363,7 +363,7 @@ class MainWindow(QWidget):
 
     def _show_security_settings_dialog(self):
         """Opens the dialog for security settings."""
-        dialog = SecuritySettingsDialog(self)
+        dialog = SecuritySettingsDialog(self, security_manager=self.security_manager)
         dialog.exec_()
 
     def navigate_back(self):
@@ -445,6 +445,15 @@ class MainWindow(QWidget):
             self.files_tree.clear() # Clear existing files if token failed
             return
             
+        # Check if encryption key is available before making a request to an encrypted endpoint
+        if not self.security_manager.get_encryption_key():
+            logger.error("Encryption key not loaded. Cannot decrypt directory listing.")
+            QMessageBox.critical(self, "Security Error",
+                                 "Encryption key not loaded. Cannot browse peer files securely.\n"
+                                 "Please ensure you've entered the correct security code.")
+            self.files_tree.clear()
+            return
+            
         try:
             # Make request to peer's /browse endpoint with current_path
             r = requests.get(
@@ -456,7 +465,11 @@ class MainWindow(QWidget):
             )
             r.raise_for_status() # Raise an HTTPError for bad responses (4xx or 5xx)
             
-            items = r.json()
+            # Decrypt the response content
+            encrypted_data = r.content
+            decrypted_data = self.security_manager.decrypt_data(encrypted_data)
+            
+            items = json.loads(decrypted_data.decode('utf-8'))
             self.update_files_tree(items)
             logger.info(f"Refreshed directory '{self.current_path}' on {self.current_peer} ({len(items)} items).")
         except requests.exceptions.RequestException as e:
@@ -495,190 +508,177 @@ class MainWindow(QWidget):
         # self.files_tree.sortByColumn(0, Qt.AscendingOrder) # Manual sort applied, so no need for this.
 
     def download_selected_files(self):
-        """
-        Initiates the download of selected files or folders from the current peer.
-        Launches a DownloadProcess in a separate thread.
-        """
-        if not self.current_peer:
-            logger.warning("Download attempted without selecting a peer.")
-            QMessageBox.warning(self, "No Peer Selected", "Please select a peer first.")
-            return
+        """Initiates download of selected files/folders from current peer."""
+        try:
+            logger.info("Starting download_selected_files()")
             
-        selected_items = self.files_tree.selectedItems()
-        if not selected_items:
-            logger.warning("No items selected for download.")
-            QMessageBox.warning(self, "No Items Selected", "Please select files or folders to download.")
-            return
-            
-        # Pre-check: Ensure encryption key is loaded before initiating download
-        if self.security_manager.get_encryption_key() is None:
+            if not self.current_peer:
+                logger.warning("No peer selected for download")
+                return
+                
+            selected_items = self.files_tree.selectedItems()
+            if not selected_items:
+                logger.warning("No items selected for download")
+                return
+            logger.debug(f"Selected items are ---- {selected_items}")
 
-            QMessageBox.critical(self, "Security Error",
-                                 "Encryption key not loaded. Cannot download/decrypt files securely.\n"
-                                 "Please ensure you've entered the correct security code on startup.")
-            logger.error("Download blocked: Encryption key not loaded.")
-            return
+            # Get download directory from user
+            download_dir = QFileDialog.getExistingDirectory(
+                self, "Select Download Location",
+                str(Path.home() / "Downloads"),
+                QFileDialog.ShowDirsOnly
+            )
+            
+            if not download_dir:
+                logger.info("Download cancelled - no directory selected")
+                return
+                
+            logger.debug("Download directory selected: %s", download_dir)
 
-        # Reset cancellation flag for new operation
-        with self._operation_lock:
-            self.is_operation_cancelled = False
+            # Extract peer information
+            peer_text = self.current_peer
+            peer_name, ip_and_port = peer_text.split(' ')
+            ip, port = ip_and_port.split(':')
+
+            # Filter symbols '(', ')'
+            port = port.replace(")", "")
+            ip = ip.replace("(", "")
+
+            port = int(port)
             
-        # Prompt user for download directory
-        download_dir = QFileDialog.getExistingDirectory(
-            self, "Select Download Directory", str(Path.home())
-        )
-        if not download_dir:
-            logger.info("Download cancelled by user: No directory selected.")
-            return
-            
-        ip_port_str = self.current_peer.split("(")[-1].strip(")")
-        ip, port_str = ip_port_str.split(":")
-        port = int(port_str)
-        
-        # Get token for the peer; this might block or show a warning
-        token = self.get_peer_token(ip, port)
-        if not token:
-            logger.warning("Download aborted due to token failure.")
-            return
-            
-        # Prepare items list for the download process
-        items_to_download = [] # List of [full_path_on_peer, original_name]
-        is_any_folder_selected = False
-        for item in selected_items:
-            path_on_peer = item.data(0, Qt.UserRole) # This path is now the absolute path from the server
-            original_name = item.text(0)
-            is_dir = item.data(0, Qt.UserRole + 1)
-            items_to_download.append([path_on_peer, original_name])
-            if is_dir:
-                is_any_folder_selected = True # Flag if any folder is selected
-        
-        # Create and show progress dialog
-        progress_dialog = QProgressDialog(
-            "Preparing download...", "Cancel", 0, 100, self
-        )
-        progress_dialog.setWindowTitle("Download Progress")
-        progress_dialog.setWindowModality(Qt.WindowModal) # Blocks interaction with main window
-        progress_dialog.setMinimumDuration(0) # Show immediately
-        progress_dialog.setAutoClose(False) # Keep open until explicitly closed
-        progress_dialog.setAutoReset(False)
-        progress_dialog.setMinimumWidth(400) # Ensure it's wide enough for messages
-        progress_dialog.canceled.connect(self.cancel_download) # Connect cancel button
-        
-        # Store progress dialog and process reference under lock
-        with self._operation_lock:
-            self.current_progress = progress_dialog
-        
-        # Create and start DownloadProcess worker
-        download_process = DownloadProcess(self)
-        download_process.progress.connect(self.update_download_progress)
-        download_process.finished.connect(self.handle_download_finished)
-        download_process.cleanup.connect(self.cleanup_download) # Connect for final cleanup
-        
-        with self._operation_lock:
-            self.current_download = download_process
-        
-        # Start the external download process
-        download_process.start_download(ip, port, token, items_to_download, download_dir, is_any_folder_selected)
-        
-        # Show progress bar in main window for ongoing visual feedback (optional, as dialog also shows)
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setFormat("Initializing download...")
+            logger.debug("Peer information - IP: %s, Port: %d", ip, port)
+
+            # Get authentication token
+            token = self.get_peer_token(ip, port)
+            if not token:
+                logger.error("Failed to get authentication token for peer %s", peer_text)
+                self.handle_download_error("Failed to authenticate with peer")
+                return
+
+            # Prepare items list for download
+            items_to_download = []
+            for item in selected_items:
+                remote_path = self._get_item_path(item)
+                is_folder = Path(remote_path).is_dir()
+                local_name = item.text(0)
+                
+                items_to_download.append([remote_path, local_name])
+                logger.debug("Adding to download queue - Remote: %s, Local: %s, Is Folder: %s",
+                           remote_path, local_name, is_folder)
+
+            if not items_to_download:
+                logger.warning("No valid items to download")
+                return
+
+            # Create and configure download process
+            with self._operation_lock:
+                if self.current_download:
+                    logger.warning("Download already in progress")
+                    QMessageBox.warning(self, "Download in Progress",
+                                     "Please wait for the current download to finish.")
+                    return
+
+                logger.info("Creating new download process")
+                self.current_download = DownloadProcess(self, security_manager=self.security_manager)
+                self.current_download.progress.connect(self.update_download_progress)
+                self.current_download.finished.connect(self.handle_download_finished)
+                self.current_download.cleanup.connect(self.cleanup_download)
+
+                # Create progress dialog
+                self.current_progress = QProgressDialog("Preparing download...", "Cancel", 0, 100, self)
+                self.current_progress.setWindowTitle("Downloading Files")
+                self.current_progress.setWindowModality(Qt.WindowModal)
+                self.current_progress.canceled.connect(self.cancel_download)
+                self.current_progress.setAutoClose(False)
+                self.current_progress.show()
+
+                # Start download
+                logger.info("Starting download process - Items: %d, Total size: %d Is folder %s",
+                          len(items_to_download), sum(os.path.getsize(item[0]) if os.path.exists(item[0]) else 0 
+                                                    for item in items_to_download),
+                                                    any(Path(item[0]).is_dir() for item in items_to_download)
+                                                    )
+                                                    
+                self.current_download.start_download(
+                    ip, port, token, items_to_download,
+                    download_dir, any(Path(item[0]).is_dir() for item in items_to_download)
+                )
+
+        except Exception as e:
+            logger.error("Error in download_selected_files", exc_info=True)
+            self.handle_download_error(f"Download failed: {str(e)}")
 
     def update_download_progress(self, value: int, message: str):
-        """Updates the progress dialog and main window's progress bar during download."""
-        with self._operation_lock:
-            if self.is_operation_cancelled:
-                return # Ignore updates if cancelled
-                
-            if self.current_progress and not self.current_progress.wasCanceled():
-                try:
-                    self.current_progress.setValue(value)
-                    self.current_progress.setLabelText(message)
-                except RuntimeError as e: # Handle potential RuntimeError if dialog is closed unexpectedly
-                    logger.warning(f"Progress dialog error during update: {e}. Initiating error handling.")
-                    self._handle_operation_error()
-                except Exception as e:
-                    logger.error(f"Unexpected error updating download progress: {e}", exc_info=True)
-                    self._handle_operation_error()
-            
-            # Update main window's progress bar (less frequent updates than dialog)
-            if self.progress_bar.isVisible():
-                self.progress_bar.setValue(value)
-                self.progress_bar.setFormat(f"Download: {message} ({value}%)")
+        """Updates the progress dialog with current download progress."""
+        try:
+            logger.debug("Download progress update: %d%% - %s", value, message)
+            if self.current_progress:
+                self.current_progress.setValue(value)
+                self.current_progress.setLabelText(message)
+        except Exception as e:
+            logger.error("Error updating download progress", exc_info=True)
 
     def handle_download_finished(self, success: bool, message: str):
-        """Handles the completion of a download operation (success or failure)."""
-        logger.info(f"Download finished. Success: {success}, Message: {message}")
-        # Show message box in a non-blocking way (after current event loop iteration)
-        if success:
-            QTimer.singleShot(0, lambda: QMessageBox.information(self, "Success", message))
-        else:
-            QTimer.singleShot(0, lambda: QMessageBox.warning(self, "Download Failed", message))
+        """Handles completion of download process."""
+        try:
+            if success:
+                logger.info("Download completed successfully: %s", message)
+            else:
+                logger.error("Download failed: %s", message)
+                
+            if self.current_progress:
+                if success:
+                    self.current_progress.setLabelText("Download completed successfully!")
+                else:
+                    self.current_progress.setLabelText(f"Download failed: {message}")
+                self.current_progress.setValue(100)
+                
+            # Schedule cleanup after a short delay
+            self._schedule_cleanup()
             
-        self.cleanup_download() # Trigger cleanup directly when finished signal is received
+        except Exception as e:
+            logger.error("Error handling download completion", exc_info=True)
 
     def cleanup_download(self):
-        """
-        Cleans up resources associated with a completed or cancelled download operation.
-        Called when DownloadProcess.cleanup signal is emitted.
-        """
-        logger.debug("cleanup_download called.")
-        with self._operation_lock:
-            if self._cleanup_in_progress: # Prevent re-entry if already cleaning up
-                logger.debug("Cleanup already in progress for download, skipping re-entry.")
-                return
-            self._cleanup_in_progress = True
+        """Cleans up resources after download completion."""
+        try:
+            logger.info("Starting download cleanup")
+            with self._operation_lock:
+                if self.current_progress:
+                    logger.debug("Closing progress dialog")
+                    self.current_progress.close()
+                    self.current_progress = None
 
-            # Get references and then clear them
-            progress_dialog = self.current_progress
-            download_process = self.current_download
-            
-            self.current_progress = None
-            self.current_download = None
-            self.is_operation_cancelled = False # Reset for next operation
+                if self.current_download:
+                    logger.debug("Cleaning up download process")
+                    self.current_download.deleteLater()
+                    self.current_download = None
 
-            if progress_dialog:
-                try:
-                    logger.debug("Closing progress dialog in cleanup_download.")
-                    progress_dialog.close()
-                except Exception as e:
-                    logger.error(f"Error closing progress dialog in cleanup_download: {e}")
-                    
-            if download_process:
-                try:
-                    logger.debug("Stopping and deleting download process in cleanup_download.")
-                    if download_process.process.state() == QProcess.Running:
-                        download_process.stop() # Ensure process is terminated
-                    download_process.deleteLater() # Schedule QObject for deletion
-                except Exception as e:
-                    logger.error(f"Error cleaning up download process in cleanup_download: {e}")
-                    
-            self.progress_bar.setVisible(False) # Hide main window progress bar
-            self.progress_bar.setValue(0)
-            self.progress_bar.setFormat("")
-
-            self._cleanup_in_progress = False # Reset flag
-            logger.debug("Download resources cleaned up.")
+                self.is_operation_cancelled = False
+                logger.info("Download cleanup completed")
+                
+        except Exception as e:
+            logger.error("Error during download cleanup", exc_info=True)
 
     def cancel_download(self):
-        """Initiates cancellation of the current download operation."""
-        logger.info("Download cancellation requested by user via progress dialog.")
-        with self._operation_lock:
-            if not self.is_operation_cancelled:
-                self.is_operation_cancelled = True # Set flag first
-                
+        """Cancels the current download operation."""
+        try:
+            logger.info("User requested download cancellation")
+            with self._operation_lock:
+                self.is_operation_cancelled = True
                 if self.current_download:
-                    logger.info("Signaling current_download process to stop.")
-                    self.current_download.stop() # This should trigger cleanup_download eventually
-                
+                    logger.debug("Stopping current download process")
+                    self.current_download.stop()
+                    
                 if self.current_progress:
-                    try:
-                        self.current_progress.close() # Close dialog immediately
-                    except Exception as e:
-                        logger.error(f"Error closing progress dialog during download cancel: {e}")
-                
-                logger.info("Download cancellation processed.")
+                    logger.debug("Updating progress dialog for cancellation")
+                    self.current_progress.setLabelText("Cancelling download...")
+                    self.current_progress.setValue(100)
+                    
+            logger.info("Download cancellation initiated")
+            
+        except Exception as e:
+            logger.error("Error cancelling download", exc_info=True)
 
     def upload_file_to_peer(self):
         """
@@ -779,7 +779,7 @@ class MainWindow(QWidget):
             self.current_progress = progress_dialog
         
         # Create and start UploadWorker thread
-        worker = UploadWorker(ip, port, token, source_path, dest_path, is_folder, parent=self)
+        worker = UploadWorker(ip, port, token, source_path, dest_path, is_folder, parent=self, security_manager=self.security_manager)
         
         with self._operation_lock:
             self.current_worker = worker
@@ -797,100 +797,75 @@ class MainWindow(QWidget):
         
     def update_upload_progress(self, value: int, message: str):
         """Updates the progress dialog and main window's progress bar during upload."""
-        with self._operation_lock:
-            if self.is_operation_cancelled:
-                return # Ignore updates if cancelled
-                
-            if self.current_progress and not self.current_progress.wasCanceled():
-                try:
-                    self.current_progress.setValue(value)
-                    self.current_progress.setLabelText(message)
-                except RuntimeError as e:
-                    logger.warning(f"Progress dialog error during update: {e}. Initiating error handling.")
-                    self._handle_operation_error()
-                except Exception as e:
-                    logger.error(f"Unexpected error updating upload progress: {e}", exc_info=True)
-                    self._handle_operation_error()
-            
-            # Update main window's progress bar
-            if self.progress_bar.isVisible():
-                self.progress_bar.setValue(value)
-                self.progress_bar.setFormat(f"Upload: {message} ({value}%)")
-            
+        try:
+            logger.debug("Upload progress update: %d%% - %s", value, message)
+            if self.current_progress:
+                self.current_progress.setValue(value)
+                self.current_progress.setLabelText(message)
+        except Exception as e:
+            logger.error("Error updating upload progress", exc_info=True)
+
     def handle_upload_finished(self, success: bool, message: str):
-        """Handles the completion of an upload operation (success or failure)."""
-        logger.info(f"Upload finished. Success: {success}, Message: {message}")
-        # Show message box in a non-blocking way
-        if success:
-            QTimer.singleShot(0, lambda: QMessageBox.information(self, "Success", message))
-        else:
-            QTimer.singleShot(0, lambda: QMessageBox.warning(self, "Upload Failed", message))
-        
-        self.cleanup_upload() # Trigger cleanup directly when finished signal is received
+        """Handles completion of upload process."""
+        try:
+            if success:
+                logger.info("Upload completed successfully: %s", message)
+            else:
+                logger.error("Upload failed: %s", message)
+                
+            if self.current_progress:
+                if success:
+                    self.current_progress.setLabelText("Upload completed successfully!")
+                else:
+                    self.current_progress.setLabelText(f"Upload failed: {message}")
+                self.current_progress.setValue(100)
+                
+            # Schedule cleanup after a short delay
+            self._schedule_cleanup()
+            
+        except Exception as e:
+            logger.error("Error handling upload completion", exc_info=True)
 
     def cleanup_upload(self):
-        """
-        Cleans up resources associated with a completed or cancelled upload operation.
-        Called when UploadWorker.finished signal is received.
-        """
-        logger.debug("cleanup_upload called.")
-        with self._operation_lock:
-            if self._cleanup_in_progress:
-                logger.debug("Cleanup already in progress for upload, skipping re-entry.")
-                return
-            self._cleanup_in_progress = True
+        """Cleans up resources after upload completion."""
+        try:
+            logger.info("Starting upload cleanup")
+            with self._operation_lock:
+                if self.current_progress:
+                    logger.debug("Closing progress dialog")
+                    self.current_progress.close()
+                    self.current_progress = None
 
-            # Get references and then clear them
-            progress_dialog = self.current_progress
-            worker = self.current_worker
-            
-            self.current_progress = None
-            self.current_worker = None
-            self.is_operation_cancelled = False # Reset for next operation
+                if self.current_worker:
+                    logger.debug("Cleaning up upload worker")
+                    self.current_worker.deleteLater()
+                    self.current_worker = None
 
-            if progress_dialog:
-                try:
-                    logger.debug("Closing progress dialog in cleanup_upload.")
-                    progress_dialog.close()
-                except Exception as e:
-                    logger.error(f"Error closing progress dialog in cleanup_upload: {e}")
-            
-            if worker:
-                try:
-                    logger.debug("Terminating worker in cleanup_upload if still running.")
-                    if worker.isRunning():
-                        worker.terminate() # Force terminate if still running
-                        worker.wait(500) # Give it a moment
-                    worker.deleteLater() # Schedule QObject for deletion
-                except Exception as e:
-                    logger.error(f"Error cleaning up upload worker in cleanup_upload: {e}")
-                    
-            self.progress_bar.setVisible(False) # Hide main window progress bar
-            self.progress_bar.setValue(0)
-            self.progress_bar.setFormat("")
-            
-            self._cleanup_in_progress = False # Reset flag
-            logger.debug("Upload resources cleaned up.")
+                self.is_operation_cancelled = False
+                logger.info("Upload cleanup completed")
+                
+        except Exception as e:
+            logger.error("Error during upload cleanup", exc_info=True)
 
     def cancel_upload(self):
-        """Initiates cancellation of the current upload operation."""
-        logger.info("Upload cancellation requested by user via progress dialog.")
-        with self._operation_lock:
-            if not self.is_operation_cancelled:
-                self.is_operation_cancelled = True # Set flag first
-                
+        """Cancels the current upload operation."""
+        try:
+            logger.info("User requested upload cancellation")
+            with self._operation_lock:
+                self.is_operation_cancelled = True
                 if self.current_worker:
-                    logger.info("Signaling upload worker to cancel...")
-                    self.current_worker.cancel() # This sets the internal cancellation flag
-                    # The worker's run() method should detect this and emit finished signal
-                
+                    logger.debug("Cancelling current upload worker")
+                    self.current_worker.cancel()
+                    
                 if self.current_progress:
-                    try:
-                        self.current_progress.close() # Close dialog immediately
-                    except Exception as e:
-                        logger.error(f"Error closing progress dialog during upload cancel: {e}")
-                
-                logger.info("Upload cancellation processed.")
+                    logger.debug("Updating progress dialog for cancellation")
+                    self.current_progress.setLabelText("Cancelling upload...")
+                    self.current_progress.setValue(100)
+                    
+            logger.info("Upload cancellation initiated")
+            
+        except Exception as e:
+            logger.error("Error cancelling upload", exc_info=True)
 
     def _handle_operation_error(self):
         """
@@ -1436,6 +1411,10 @@ class MainWindow(QWidget):
                 fetcher.wait(1000) # Give time for thread to exit
             fetcher.deleteLater() # Schedule QObject for deletion
             logger.debug(f"Removed and cleaned up TokenFetcher for '{peer_text_key}'.")
+
+    def _get_item_path(self, item):
+        """Returns the full remote path for a given QTreeWidgetItem."""
+        return item.data(0, Qt.UserRole)
 
 
 def run(app_instance=None):
