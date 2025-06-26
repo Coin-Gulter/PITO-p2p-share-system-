@@ -82,3 +82,6 @@ Thumbs.db
 *.bak
 *.tmp
 *.temp 
+
+# Config
+*.json
