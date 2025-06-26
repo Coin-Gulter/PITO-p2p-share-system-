@@ -134,38 +134,38 @@ async def ping():
     logger.debug("Received ping request")
     return {"status": "online", "device_id": settings.device_id}
 
-# The /files endpoint is still specific to the original SHARE_DIR
-@app.get("/files", dependencies=[Depends(require_auth)])
-def list_files():
-    """List visible files in the original P2PShare directory only (legacy)."""
-    try:
-        files = []
-        for f in get_share_dir().iterdir():
-            if (f.is_file() and 
-                not f.name.startswith('.') and 
-                not f.name.startswith('~') and
-                f.parent == get_share_dir()):
-                try:
-                    if os.access(f, os.R_OK):
-                        files.append(f.name)
-                except Exception as e:
-                    logger.warning(f"Error accessing file {f}: {str(e)}")
-                    continue
-        logger.info(f"Listed {len(files)} files in legacy share directory")
-        return JSONResponse(files)
-    except Exception as e:
-        logger.error(f"Error listing files: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+# # The /files endpoint is still specific to the original SHARE_DIR
+# @app.get("/files", dependencies=[Depends(require_auth)])
+# def list_files():
+#     """List visible files in the original P2PShare directory only (legacy)."""
+#     try:
+#         files = []
+#         for f in get_share_dir().iterdir():
+#             if (f.is_file() and 
+#                 not f.name.startswith('.') and 
+#                 not f.name.startswith('~') and
+#                 f.parent == get_share_dir()):
+#                 try:
+#                     if os.access(f, os.R_OK):
+#                         files.append(f.name)
+#                 except Exception as e:
+#                     logger.warning(f"Error accessing file {f}: {str(e)}")
+#                     continue
+#         logger.info(f"Listed {len(files)} files in legacy share directory")
+#         return JSONResponse(files)
+#     except Exception as e:
+#         logger.error(f"Error listing files: {str(e)}", exc_info=True)
+#         raise HTTPException(status_code=500, detail=str(e))
 
-# The /files/{filename} endpoint is still specific to the original SHARE_DIR
-@app.get("/files/{filename}", dependencies=[Depends(require_auth)])
-def download_file_legacy(filename: str):
-    file_path = get_share_dir() / filename
-    if file_path.exists():
-        logger.info(f"Legacy file download requested: {filename}")
-        return FileResponse(file_path)
-    logger.warning(f"Legacy file not found: {filename}")
-    raise HTTPException(status_code=404, detail="File not found")
+# # The /files/{filename} endpoint is still specific to the original SHARE_DIR
+# @app.get("/files/{filename}", dependencies=[Depends(require_auth)])
+# def download_file_legacy(filename: str):
+#     file_path = get_share_dir() / filename
+#     if file_path.exists():
+#         logger.info(f"Legacy file download requested: {filename}")
+#         return FileResponse(file_path)
+#     logger.warning(f"Legacy file not found: {filename}")
+#     raise HTTPException(status_code=404, detail="File not found")
 
 @app.post("/auth")
 def auth(request: AuthRequest):
