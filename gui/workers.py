@@ -833,8 +833,18 @@ class TokenFetcher(QThread):
                 timeout=(3, 5)
             )
             r.raise_for_status() # Raise an exception for bad status codes (4xx or 5xx)
-            token = r.json()["access_token"]  
-            logger.debug(f"Successfully obtained token for {self.peer_text}.")
+            token_b64 = r.json()["access_token"]
+            # Decrypt the token before returning (FIXED)
+            # Use a SecurityManager instance (reuse or create as needed)
+            # If self.parent has security_manager, use it; else, create one
+            security_manager = None
+            if hasattr(self.parent(), 'security_manager') and self.parent().security_manager:
+                security_manager = self.parent().security_manager
+            else:
+                security_manager = SecurityManager(CONFIG_DIR)
+            encrypted_token = base64.b64decode(token_b64)
+            token = security_manager.decrypt_data(encrypted_token).decode('utf-8')
+            logger.debug(f"Successfully obtained token for {self.peer_text} (decrypted JWT).")
             return token
         except requests.exceptions.RequestException as e:
             logger.warning(f"Error fetching token from {self.peer_text}: {str(e)}")

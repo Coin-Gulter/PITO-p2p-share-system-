@@ -171,7 +171,13 @@ async def ping():
 def auth(request: AuthRequest):
     logger.info(f"Authentication request from device: {request.device_id}")
     token = create_jwt(request.device_id)
-    return {"access_token": token}
+    # Encrypt and base64-encode the token before returning
+    if not security_manager or not security_manager.get_encryption_key():
+        logger.critical("Auth endpoint called but security manager is not initialized with key. Cannot proceed.")
+        raise HTTPException(status_code=500, detail="Server encryption is not configured.")
+    encrypted_token = security_manager.encrypt_data(token.encode('utf-8'))
+    encoded_token = base64.b64encode(encrypted_token).decode('utf-8')
+    return {"access_token": encoded_token}
 
 def get_file_info_for_client(full_item_path: Path) -> FileInfo:
     """
@@ -219,59 +225,45 @@ def list_directory(path: str = Query("/", description="Directory path to list"))
     if not security_manager or not security_manager.get_encryption_key():
         logger.critical("Browse endpoint called but security manager is not initialized with key. Cannot proceed.")
         raise HTTPException(status_code=500, detail="Server encryption is not configured.")
-        
     try:
         target_path: Path
         items = []
-
         if path == "/":
             if platform.system() == "Windows":
-                # On Windows, list drive letters
                 drive_letters = []
                 for drive in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
                     drive_path = Path(f"{drive}:/")
                     if drive_path.exists() and drive_path.is_dir():
                         drive_letters.append(drive_path)
-                
                 for drive_p in drive_letters:
                     if is_path_blacklisted(drive_p):
                         logger.warning(f"Skipping blacklisted drive: {drive_p}")
                         continue
                     try:
-                        # For drives, the 'name' in FileInfo should be just the drive letter (e.g., 'C').
-                        # The 'path' should be 'C:/'
                         items.append(get_file_info_for_client(drive_p).model_dump())
                     except Exception as e:
                         logger.warning(f"Error getting info for drive {drive_p}: {e}")
-                        continue # Skip problematic drives
+                        continue
                 logger.info(f"Listed available drives: {len(items)} items")
             else:
-                # On Unix-like systems, list contents of '/'
                 target_path = Path('/')
                 if is_path_blacklisted(target_path):
                     raise HTTPException(status_code=403, detail="Access to this path is forbidden.")
-                
                 for item_path in target_path.iterdir():
                     if is_path_blacklisted(item_path):
-                        continue # Skip blacklisted items within a non-blacklisted dir
+                        continue
                     try:
                         items.append(get_file_info_for_client(item_path).model_dump())
                     except Exception as e:
                         logger.warning(f"Could not stat {item_path}, skipping: {e}")
                         continue
                 logger.info(f"Listed contents of root directory: {len(items)} items")
-
         else:
-            # For non-root requests, assume path is an absolute path.
-            # Convert to Path and resolve to handle '..' etc.
             target_path = Path(path).resolve()
-
-            # Security checks for any requested path (including subdirectories of drives on Windows)
             if not target_path.exists() or not target_path.is_dir():
                 raise HTTPException(status_code=404, detail="Directory not found")
             if is_path_blacklisted(target_path):
                 raise HTTPException(status_code=403, detail="Access to this path is forbidden.")
-            
             for item_path in target_path.iterdir():
                 if is_path_blacklisted(item_path):
                     continue
@@ -281,18 +273,12 @@ def list_directory(path: str = Query("/", description="Directory path to list"))
                     logger.warning(f"Could not stat {item_path}, skipping: {e}")
                     continue
             logger.info(f"Listed contents of {path}: {len(items)} items")
-        
-        # Serialize the list of FileInfo dictionaries to a JSON string
         items_json = json.dumps(items)
-        
-        # Encrypt the JSON string
         encrypted_data = security_manager.encrypt_data(items_json.encode('utf-8'))
-        
-        # Return the encrypted data as a binary response
-        return Response(content=encrypted_data, media_type="application/octet-stream")
-
+        # Return as base64-encoded string in a JSON object (to match client expectation)
+        return {"data": base64.b64encode(encrypted_data).decode("utf-8")}
     except HTTPException:
-        raise # Re-raise HTTP exceptions to let FastAPI handle them
+        raise
     except Exception as e:
         logger.error(f"Error listing directory '{path}': {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to list directory: {e}")

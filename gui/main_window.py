@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 from datetime import datetime
 import platform # To detect OS for drive listing
+import base64
+import urllib.parse
 
 from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QLabel,
                              QPushButton, QListWidget, QListWidgetItem, QFileDialog,
@@ -107,7 +109,7 @@ class MainWindow(QWidget):
 
             # Initial state for file browser - now starts at system root '/'
             self.current_peer = None
-            self.current_path = "/" # Start at system root or drive list
+            self.current_path = "~" # Start at system root or drive list
             self.path_history = []
 
             # Defer initial tasks to ensure main window is fully initialized and shown
@@ -433,19 +435,14 @@ class MainWindow(QWidget):
             logger.warning("Cannot refresh files: No peer selected.")
             QMessageBox.information(self, "No Peer Selected", "Please select a peer to browse its files.")
             return
-            
         ip_port_str = self.current_peer.split("(")[-1].strip(")")
         ip, port_str = ip_port_str.split(":")
         port = int(port_str)
-        
-        # Get token for the peer; this might block or show a warning dialog
         token = self.get_peer_token(ip, port)
         if not token:
             logger.warning(f"Failed to get token for {self.current_peer}, cannot refresh files.")
-            self.files_tree.clear() # Clear existing files if token failed
+            self.files_tree.clear()
             return
-            
-        # Check if encryption key is available before making a request to an encrypted endpoint
         if not self.security_manager.get_encryption_key():
             logger.error("Encryption key not loaded. Cannot decrypt directory listing.")
             QMessageBox.critical(self, "Security Error",
@@ -453,29 +450,15 @@ class MainWindow(QWidget):
                                  "Please ensure you've entered the correct security code.")
             self.files_tree.clear()
             return
-            
         try:
-            # Make request to peer's /browse endpoint with current_path
-            r = requests.get(
-                f"https://{ip}:{port}/browse",
-                params={"path": self.current_path}, # Send the full absolute path
-                headers={"Authorization": f"Bearer {token}"},
-                verify=False, # Disable SSL verification for self-signed certs
-                timeout=10 # Add a timeout
-            )
-            r.raise_for_status() # Raise an HTTPError for bad responses (4xx or 5xx)
-            
-            # Decrypt the response content
-            encrypted_data = r.content
-            decrypted_data = self.security_manager.decrypt_data(encrypted_data)
-            
-            items = json.loads(decrypted_data.decode('utf-8'))
+            items = browse_peer_path_cli(self.security_manager, ip, port, token, self.current_path)
+            if items is None:
+                logger.error(f"Failed to browse path '{self.current_path}' on peer {self.current_peer}.")
+                QMessageBox.warning(self, "Browse Error", f"Failed to browse path '{self.current_path}' on peer.\n\nThis may be due to permissions, blacklisting, or the path not existing.")
+                self.files_tree.clear()
+                return
             self.update_files_tree(items)
             logger.info(f"Refreshed directory '{self.current_path}' on {self.current_peer} ({len(items)} items).")
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error fetching directory listing from {self.current_peer} for path '{self.current_path}': {e}", exc_info=True)
-            QMessageBox.warning(self, "Error", f"Failed to get directory listing from {self.current_peer}:\n{e}\n\nCheck path and permissions on the remote peer.")
-            self.files_tree.clear()
         except Exception as e:
             logger.error(f"Unexpected error refreshing files for {self.current_peer} on path '{self.current_path}': {e}", exc_info=True)
             QMessageBox.warning(self, "Error", f"An unexpected error occurred while refreshing files:\n{e}")
@@ -511,99 +494,84 @@ class MainWindow(QWidget):
         """Initiates download of selected files/folders from current peer."""
         try:
             logger.info("Starting download_selected_files()")
-            
             if not self.current_peer:
                 logger.warning("No peer selected for download")
                 return
-                
             selected_items = self.files_tree.selectedItems()
             if not selected_items:
                 logger.warning("No items selected for download")
                 return
             logger.debug(f"Selected items are ---- {selected_items}")
-
-            # Get download directory from user
             download_dir = QFileDialog.getExistingDirectory(
                 self, "Select Download Location",
                 str(Path.home() / "Downloads"),
                 QFileDialog.ShowDirsOnly
             )
-            
             if not download_dir:
                 logger.info("Download cancelled - no directory selected")
                 return
-                
             logger.debug("Download directory selected: %s", download_dir)
-
-            # Extract peer information
             peer_text = self.current_peer
             peer_name, ip_and_port = peer_text.split(' ')
             ip, port = ip_and_port.split(':')
-
-            # Filter symbols '(', ')'
             port = port.replace(")", "")
             ip = ip.replace("(", "")
-
             port = int(port)
-            
             logger.debug("Peer information - IP: %s, Port: %d", ip, port)
-
-            # Get authentication token
             token = self.get_peer_token(ip, port)
             if not token:
                 logger.error("Failed to get authentication token for peer %s", peer_text)
                 self.handle_download_error("Failed to authenticate with peer")
                 return
-
-            # Prepare items list for download
+            # Prepare items list for download using remote metadata
             items_to_download = []
+            any_folder_selected = False
+            folder_item = None
             for item in selected_items:
                 remote_path = self._get_item_path(item)
-                is_folder = Path(remote_path).is_dir()
+                is_folder = item.data(0, Qt.UserRole + 1)
                 local_name = item.text(0)
-                
                 items_to_download.append([remote_path, local_name])
-                logger.debug("Adding to download queue - Remote: %s, Local: %s, Is Folder: %s",
-                           remote_path, local_name, is_folder)
-
+                if is_folder and not any_folder_selected:
+                    any_folder_selected = True
+                    folder_item = item
+            # If any folder is selected, only download the first folder
+            if any_folder_selected:
+                remote_path = self._get_item_path(folder_item)
+                local_name = folder_item.text(0)
+                items_to_download = [[remote_path, local_name]]
+                is_folder = True
+            else:
+                is_folder = False
             if not items_to_download:
                 logger.warning("No valid items to download")
                 return
-
-            # Create and configure download process
             with self._operation_lock:
                 if self.current_download:
                     logger.warning("Download already in progress")
                     QMessageBox.warning(self, "Download in Progress",
                                      "Please wait for the current download to finish.")
                     return
-
                 logger.info("Creating new download process")
                 self.current_download = DownloadProcess(self, security_manager=self.security_manager)
                 self.current_download.progress.connect(self.update_download_progress)
                 self.current_download.finished.connect(self.handle_download_finished)
                 self.current_download.cleanup.connect(self.cleanup_download)
-
-                # Create progress dialog
                 self.current_progress = QProgressDialog("Preparing download...", "Cancel", 0, 100, self)
                 self.current_progress.setWindowTitle("Downloading Files")
                 self.current_progress.setWindowModality(Qt.WindowModal)
                 self.current_progress.canceled.connect(self.cancel_download)
                 self.current_progress.setAutoClose(False)
                 self.current_progress.show()
-
-                # Start download
                 logger.info("Starting download process - Items: %d, Total size: %d Is folder %s",
                           len(items_to_download), sum(os.path.getsize(item[0]) if os.path.exists(item[0]) else 0 
                                                     for item in items_to_download),
-                                                    any(Path(item[0]).is_dir() for item in items_to_download)
+                                                    is_folder
                                                     )
-                                                    
                 self.current_download.start_download(
                     ip, port, token, items_to_download,
-                    download_dir, any(Path(item[0]).is_dir() for item in items_to_download)
+                    download_dir, is_folder
                 )
-
         except Exception as e:
             logger.error("Error in download_selected_files", exc_info=True)
             self.handle_download_error(f"Download failed: {str(e)}")
@@ -1155,40 +1123,25 @@ class MainWindow(QWidget):
         This method can block the UI if a synchronous fetch is needed.
         """
         peer_addr = f"{ip}:{port}"
-        # Construct peer_text for consistent keying in connection_attempts etc.
-        # This assumes peer_id can be derived or is not strictly needed here.
-        # For a precise peer_text, we'd need the device_id, which isn't passed here.
-        # However, for the purpose of health checks, peer_addr is sufficient as a key.
-        # A more robust solution might retrieve device_id from service_info or pass it.
-        # For now, let's just use ip:port as the unique part of the key.
-        peer_text_key = f"({peer_addr})" # Placeholder, ideally device_id should be included
-
-        # Try to find the full peer_text from the UI list for consistent keying
+        peer_text_key = f"({peer_addr})"
         found_peer_text = None
         for i in range(self.peers_list.count()):
             item = self.peers_list.item(i)
             if item and item.text().endswith(f"({peer_addr})"):
                 found_peer_text = item.text()
                 break
-        
         if found_peer_text:
-            peer_text_key = found_peer_text # Use the full text if found
-
+            peer_text_key = found_peer_text
         current_time = datetime.now()
-        
-        # 1. Check for valid cached token
         if peer_addr in self.peer_tokens:
             last_check = self.last_peer_check.get(peer_addr)
             if last_check and (current_time - last_check).total_seconds() < self.peer_check_timeout:
                 logger.debug(f"Using cached token for {peer_text_key}.")
+                print(f"[TOKEN] Using cached token for {peer_text_key}: {self.peer_tokens[peer_addr]}")
                 return self.peer_tokens[peer_addr]
-        
-        # 2. Check connection attempt limits for the peer
         attempts = self.peer_connection_attempts.get(peer_text_key, 0)
         last_success = self.peer_last_success.get(peer_text_key)
-        
         if attempts >= self.max_connection_attempts:
-            # If past max attempts and not enough time passed since last success (or no success yet)
             if not last_success or (current_time - last_success).total_seconds() < self.peer_retry_delay:
                 logger.warning(f"Too many failed token attempts for peer {peer_text_key}. Not attempting token fetch.")
                 QMessageBox.warning(
@@ -1197,69 +1150,63 @@ class MainWindow(QWidget):
                 )
                 return None
             else:
-                # Enough time passed, reset attempts and try again synchronously
                 logger.info(f"Retry delay passed for {peer_text_key}. Resetting attempts and trying synchronous fetch.")
                 self.peer_connection_attempts[peer_text_key] = 0
-                attempts = 0 # Reset for current synchronous attempt
-
-        # 3. Perform a synchronous token fetch as a fallback or for initial request
+                attempts = 0
         session = requests.Session()
         session.verify = False
         retry_strategy = requests.adapters.Retry(
-            total=0, # No retries here, let the higher level logic handle retries via attempts counter
+            total=0,
             backoff_factor=0.1,
             status_forcelist=[500, 502, 503, 504]
         )
         adapter = requests.adapters.HTTPAdapter(max_retries=retry_strategy)
         session.mount("https://", adapter)
-        
         try:
             logger.debug(f"Attempting synchronous token fetch for {peer_text_key}...")
             r = session.post(
                 f"https://{ip}:{port}/auth",
                 json={"device_id": settings.device_id},
-                timeout=(5, 10) # Increased timeout for synchronous call
+                timeout=(5, 10)
             )
-            r.raise_for_status() # Raise HTTPError for bad status codes
-            
-            token = r.json()["access_token"]
+            r.raise_for_status()
+            token_b64 = r.json()["access_token"]
+            # Base64-decode and decrypt the token (FIXED: always decrypt before use)
+            encrypted_token = base64.b64decode(token_b64)
+            token = self.security_manager.decrypt_data(encrypted_token).decode('utf-8')
             self.peer_tokens[peer_addr] = token
             self.last_peer_check[peer_addr] = current_time
-            self.peer_last_success[peer_text_key] = current_time # Update last success
-            self.peer_connection_attempts[peer_text_key] = 0 # Reset attempts
-            self.offline_peers.discard(peer_text_key) # Ensure peer is marked online
-            
+            self.peer_last_success[peer_text_key] = current_time
+            self.peer_connection_attempts[peer_text_key] = 0
+            self.offline_peers.discard(peer_text_key)
             logger.debug(f"Successfully obtained token for {peer_text_key} (synchronously).")
+            print(f"[TOKEN] Fetched new token for {peer_text_key}: {token}")
             return token
-            
         except requests.exceptions.HTTPError as e:
-            self.peer_connection_attempts[peer_text_key] = attempts + 1 # Increment on HTTP error
+            self.peer_connection_attempts[peer_text_key] = attempts + 1
             logger.warning(f"Synchronous HTTP error getting token from {peer_text_key}: {e}")
             QMessageBox.warning(
                 self, "Authentication Error",
                 f"Server returned an error from {peer_text_key}: {e.response.status_code}. Details: {e.response.text}"
             )
             return None
-            
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-            self.peer_connection_attempts[peer_text_key] = attempts + 1 # Increment on network error
+            self.peer_connection_attempts[peer_text_key] = attempts + 1
             logger.warning(f"Synchronous network error getting token from {peer_text_key}: {e}")
-            self.offline_peers.add(peer_text_key) # Mark as offline
+            self.offline_peers.add(peer_text_key)
             QMessageBox.warning(
                 self, "Connection Error",
                 f"Could not connect to {peer_text_key}. The peer may be offline or unreachable."
             )
             return None
-            
         except Exception as e:
             logger.error(f"Unexpected error in get_peer_token for {peer_text_key}: {e}", exc_info=True)
-            self.peer_connection_attempts[peer_text_key] = attempts + 1 # Increment on any unexpected error
+            self.peer_connection_attempts[peer_text_key] = attempts + 1
             QMessageBox.warning(
                 self, "Authentication Error",
                 f"An unexpected error occurred during token retrieval from {peer_text_key}: {e}"
             )
             return None
-            
         finally:
             session.close()
 
@@ -1415,6 +1362,62 @@ class MainWindow(QWidget):
     def _get_item_path(self, item):
         """Returns the full remote path for a given QTreeWidgetItem."""
         return item.data(0, Qt.UserRole)
+
+
+def browse_peer_path_cli(security_manager: SecurityManager, peer_ip: str, peer_port: int, token: str, path: str = "") -> list[dict] | None:
+    """
+    Browses a directory on a remote peer.
+    Args:
+        security_manager (SecurityManager): The security manager instance with the loaded key.
+        peer_ip (str): The IP address of the peer.
+        peer_port (int): The HTTP port of the peer.
+        token (str): The authentication token.
+        path (str): The path to browse on the remote peer (e.g., "/my_folder", "/").
+    Returns:
+        list[dict] | None: A list of dictionaries, each representing a file or directory, or None if an error occurs.
+    """
+    logger = setup_logger("browse_peer_path_cli")
+    if not security_manager.get_encryption_key():
+        logger.error("Encryption key not loaded. Cannot browse remote files.")
+        return None
+
+    # URL-encode the path to handle special characters
+    encoded_path = urllib.parse.quote(path)
+    url = f"https://{peer_ip}:{peer_port}/browse?path={encoded_path}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+    try:
+        logger.info(f"Attempting to browse path '{path}' on peer at {url}...")
+        response = requests.get(url, headers=headers, verify=False, timeout=10)
+        response.raise_for_status()
+        encrypted_data_b64 = response.json().get("data")
+        if not encrypted_data_b64:
+            logger.error("Browse response missing 'data' field or it's empty.")
+            return None
+        decrypted_data_bytes = security_manager.decrypt_data(base64.b64decode(encrypted_data_b64))
+        browsed_content = json.loads(decrypted_data_bytes.decode('utf-8'))
+        logger.info(f"Successfully browsed path '{path}'. Found {len(browsed_content)} items.")
+        return browsed_content
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"HTTP error during Browse: {e.response.status_code} - {e.response.text}")
+        return None
+    except requests.exceptions.ConnectionError as e:
+        logger.error(f"Connection error during Browse: {e}. Is the peer running at {peer_ip}:{peer_port}?")
+        return None
+    except requests.exceptions.Timeout:
+        logger.error(f"Timeout during Browse with {peer_ip}:{peer_port}. Peer might be slow or unreachable.")
+        return None
+    except json.JSONDecodeError:
+        logger.error("Failed to decode JSON response from browse endpoint or decrypted data is not valid JSON.")
+        return None
+    except ValueError as e:
+        logger.error(f"Error decrypting browse data: {e}. Possibly an encryption key mismatch or corrupted data.")
+        return None
+    except Exception as e:
+        logger.error(f"An unexpected error occurred during Browse: {e}", exc_info=True)
+        return None
 
 
 def run(app_instance=None):

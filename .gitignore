@@ -85,3 +85,4 @@ Thumbs.db
 
 # Config
 *.json
+.p2pshare
